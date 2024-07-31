@@ -11,15 +11,16 @@
     "url": "https://github.com/tauri-apps/tauri.git"
   },
   "scripts": {
-    "format": "prettier --write --end-of-line=auto \"./**/*.{cjs,js,jsx,ts,tsx,html,css,json}\" --ignore-path .gitignore",
+    "format": "prettier --write . --config .prettierrc --ignore-path .prettierignore",
+    "format:check": "prettier --check . --config .prettierrc --ignore-path .prettierignore",
     "postinstall": "husky install"
   },
   "devDependencies": {
-    "covector": "^0.7.3",
+    "covector": "^0.9.0",
     "husky": "^6.0.0",
-    "prettier": "^2.5.1"
+    "prettier": "^3.3.2"
   },
   "dependencies": {
-    "typescript": "^4.5.4"
+    "typescript": "^5.4.5"
   }
 }

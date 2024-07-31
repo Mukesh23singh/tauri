@@ -1,4 +1,4 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2019-2024 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
@@ -18,6 +18,11 @@
   }
 
   /**
+   * @type {string} - The main frame origin.
+   */
+  const origin = __TEMPLATE_origin__
+
+  /**
    * @type {Uint8Array} - Injected by Tauri during runtime
    */
   const aesGcmKeyRaw = new Uint8Array(__TEMPLATE_runtime_aes_gcm_key__)
@@ -29,7 +34,7 @@
     'raw',
     aesGcmKeyRaw,
     'AES-GCM',
-    true,
+    false,
     ['encrypt']
   )
 
@@ -37,22 +42,48 @@
    * @param {object} data
    * @return {Promise<{nonce: number[], payload: number[]}>}
    */
-  async function encrypt(data) {
-    let algorithm = Object.create(null)
+  async function encrypt(payload) {
+    const algorithm = Object.create(null)
     algorithm.name = 'AES-GCM'
     algorithm.iv = window.crypto.getRandomValues(new Uint8Array(12))
 
-    let encoder = new TextEncoder()
-    let payloadRaw = encoder.encode(JSON.stringify(data))
+    const {contentType, data} = __RAW_process_ipc_message_fn__(payload)
+
+    const message =
+      typeof data === 'string'
+        ? new TextEncoder().encode(data)
+        : ArrayBuffer.isView(data) || data instanceof ArrayBuffer
+          ? data
+          : new Uint8Array(data)
 
     return window.crypto.subtle
-      .encrypt(algorithm, aesGcmKey, payloadRaw)
+      .encrypt(algorithm, aesGcmKey, message)
       .then((payload) => {
-        let result = Object.create(null)
+        const result = Object.create(null)
         result.nonce = Array.from(new Uint8Array(algorithm.iv))
         result.payload = Array.from(new Uint8Array(payload))
+        result.contentType = contentType
         return result
       })
+  }
+
+  /**
+   * Detects if a message event is a valid isolation message.
+   *
+   * @param {MessageEvent<object>} event - a message event that is expected to be an isolation message
+   * @return {boolean} - if the event was a valid isolation message
+   */
+  function isIsolationMessage(data) {
+    if (typeof data === 'object' && typeof data.payload === 'object') {
+      const keys = data.payload ? Object.keys(data.payload) : []
+      return (
+        keys.length > 0 &&
+        keys.every(
+          (key) => key === 'nonce' || key === 'payload' || key === 'contentType'
+        )
+      )
+    }
+    return false
   }
 
   /**
@@ -61,11 +92,12 @@
    * @param {MessageEvent<object>} event - a message event that is expected to be an isolation payload
    * @return boolean
    */
-  function isIsolationPayload(event) {
+  function isIsolationPayload(data) {
     return (
-      typeof event.data === 'object' &&
-      'callback' in event.data &&
-      'error' in event.data
+      typeof data === 'object' &&
+      'callback' in data &&
+      'error' in data &&
+      !isIsolationMessage(data)
     )
   }
 
@@ -74,7 +106,7 @@
    * @param {MessageEvent<any>} event
    */
   async function payloadHandler(event) {
-    if (!isIsolationPayload(event)) {
+    if (event.origin !== origin || !isIsolationPayload(event.data)) {
       return
     }
 
@@ -85,8 +117,13 @@
       data = await window.__TAURI_ISOLATION_HOOK__(data)
     }
 
-    const encrypted = await encrypt(data)
-    sendMessage(encrypted)
+    const message = Object.create(null)
+    message.cmd = data.cmd
+    message.callback = data.callback
+    message.error = data.error
+    message.options = data.options
+    message.payload = await encrypt(data.payload)
+    sendMessage(message)
   }
 
   window.addEventListener('message', payloadHandler, false)
@@ -112,4 +149,6 @@
   }
 
   setTimeout(waitUntilReady, readyIntervalMs)
+
+  document.currentScript.remove()
 })()

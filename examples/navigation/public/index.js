@@ -1,4 +1,8 @@
-const WebviewWindow = window.__TAURI__.window.WebviewWindow
+// Copyright 2019-2024 Tauri Programme within The Commons Conservancy
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
+
+const WebviewWindow = window.__TAURI__.webview.WebviewWindow
 
 const routeSelect = document.querySelector('#route')
 const link = document.querySelector('#link')

@@ -1,15 +1,15 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2019-2024 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
+import { invoke } from './core'
+import { Image } from './image'
+
 /**
- * Get application metadata.
+ * Application metadata and related APIs.
  *
- * This package is also accessible with `window.__TAURI__.app` when `tauri.conf.json > build > withGlobalTauri` is set to true.
  * @module
  */
-
-import { invokeTauriCommand } from './helpers/tauri'
 
 /**
  * Gets the application version.
@@ -19,15 +19,10 @@ import { invokeTauriCommand } from './helpers/tauri'
  * const appVersion = await getVersion();
  * ```
  *
- * @returns A promise resolving to the application version.
+ * @since 1.0.0
  */
 async function getVersion(): Promise<string> {
-  return invokeTauriCommand<string>({
-    __tauriModule: 'App',
-    message: {
-      cmd: 'getAppVersion'
-    }
-  })
+  return invoke('plugin:app|version')
 }
 
 /**
@@ -38,19 +33,14 @@ async function getVersion(): Promise<string> {
  * const appName = await getName();
  * ```
  *
- * @returns A promise resolving to application name.
+ * @since 1.0.0
  */
 async function getName(): Promise<string> {
-  return invokeTauriCommand<string>({
-    __tauriModule: 'App',
-    message: {
-      cmd: 'getAppName'
-    }
-  })
+  return invoke('plugin:app|name')
 }
 
 /**
- * Gets the tauri version.
+ * Gets the Tauri version.
  *
  * @example
  * ```typescript
@@ -58,15 +48,57 @@ async function getName(): Promise<string> {
  * const tauriVersion = await getTauriVersion();
  * ```
  *
- * @returns A promise resolving to tauri version.
+ * @since 1.0.0
  */
 async function getTauriVersion(): Promise<string> {
-  return invokeTauriCommand<string>({
-    __tauriModule: 'App',
-    message: {
-      cmd: 'getTauriVersion'
-    }
-  })
+  return invoke('plugin:app|tauri_version')
 }
 
-export { getName, getVersion, getTauriVersion }
+/**
+ * Shows the application on macOS. This function does not automatically focus any specific app window.
+ *
+ * @example
+ * ```typescript
+ * import { show } from '@tauri-apps/api/app';
+ * await show();
+ * ```
+ *
+ * @since 1.2.0
+ */
+async function show(): Promise<void> {
+  return invoke('plugin:app|app_show')
+}
+
+/**
+ * Hides the application on macOS.
+ *
+ * @example
+ * ```typescript
+ * import { hide } from '@tauri-apps/api/app';
+ * await hide();
+ * ```
+ *
+ * @since 1.2.0
+ */
+async function hide(): Promise<void> {
+  return invoke('plugin:app|app_hide')
+}
+
+/**
+ * Get the default window icon.
+ *
+ * @example
+ * ```typescript
+ * import { defaultWindowIcon } from '@tauri-apps/api/app';
+ * await defaultWindowIcon();
+ * ```
+ *
+ * @since 2.0.0
+ */
+async function defaultWindowIcon(): Promise<Image | null> {
+  return invoke<number | null>('plugin:app|default_window_icon').then((rid) =>
+    rid ? new Image(rid) : null
+  )
+}
+
+export { getName, getVersion, getTauriVersion, show, hide, defaultWindowIcon }

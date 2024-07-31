@@ -1,4 +1,4 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2019-2024 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
@@ -8,7 +8,7 @@ use std::fmt::{Debug, Formatter};
 use std::string::FromUtf8Error;
 
 use aes_gcm::aead::Aead;
-use aes_gcm::{aead::NewAead, Aes256Gcm, Nonce};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use getrandom::{getrandom, Error as CsprngError};
 use serialize_to_javascript::{default_template, Template};
 
@@ -23,7 +23,7 @@ pub enum Error {
   #[error("CSPRNG error")]
   Csprng(#[from] CsprngError),
 
-  /// Something went wrong with decryping an AES-GCM payload
+  /// Something went wrong with decrypting an AES-GCM payload
   #[error("AES-GCM")]
   Aes,
 
@@ -57,7 +57,7 @@ impl AesGcmPair {
   fn new() -> Result<Self, Error> {
     let mut raw = [0u8; 32];
     getrandom(&mut raw)?;
-    let key = aes_gcm::Key::from_slice(&raw);
+    let key = aes_gcm::Key::<Aes256Gcm>::from_slice(&raw);
     Ok(Self {
       raw,
       key: Aes256Gcm::new(key),
@@ -72,6 +72,14 @@ impl AesGcmPair {
   /// The formatted AES-GCM key
   pub fn key(&self) -> &Aes256Gcm {
     &self.key
+  }
+
+  #[doc(hidden)]
+  pub fn encrypt(&self, nonce: &[u8; 12], payload: &[u8]) -> Result<Vec<u8>, Error> {
+    self
+      .key
+      .encrypt(nonce.into(), payload)
+      .map_err(|_| self::Error::Aes)
   }
 }
 
@@ -96,31 +104,38 @@ impl Keys {
   }
 
   /// Decrypts a message using the generated keys.
-  pub fn decrypt(&self, raw: RawIsolationPayload<'_>) -> Result<String, Error> {
-    let RawIsolationPayload { nonce, payload } = raw;
+  pub fn decrypt(&self, raw: RawIsolationPayload<'_>) -> Result<Vec<u8>, Error> {
+    let RawIsolationPayload { nonce, payload, .. } = raw;
     let nonce: [u8; 12] = nonce.as_ref().try_into()?;
-    let bytes = self
+    self
       .aes_gcm
       .key
       .decrypt(Nonce::from_slice(&nonce), payload.as_ref())
-      .map_err(|_| self::Error::Aes)?;
-
-    String::from_utf8(bytes).map_err(Into::into)
+      .map_err(|_| self::Error::Aes)
   }
 }
 
 /// Raw representation of
 #[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RawIsolationPayload<'a> {
   nonce: Cow<'a, [u8]>,
   payload: Cow<'a, [u8]>,
+  content_type: Cow<'a, str>,
 }
 
-impl<'a> TryFrom<&'a str> for RawIsolationPayload<'a> {
+impl<'a> RawIsolationPayload<'a> {
+  /// Content type of this payload.
+  pub fn content_type(&self) -> &Cow<'a, str> {
+    &self.content_type
+  }
+}
+
+impl<'a> TryFrom<&'a Vec<u8>> for RawIsolationPayload<'a> {
   type Error = Error;
 
-  fn try_from(value: &'a str) -> Result<Self, Self::Error> {
-    serde_json::from_str(value).map_err(Into::into)
+  fn try_from(value: &'a Vec<u8>) -> Result<Self, Self::Error> {
+    serde_json::from_slice(value).map_err(Into::into)
   }
 }
 
@@ -141,6 +156,11 @@ pub struct IsolationJavascriptCodegen {
 pub struct IsolationJavascriptRuntime<'a> {
   /// The key used on the Rust backend and the Isolation Javascript
   pub runtime_aes_gcm_key: &'a [u8; 32],
+  /// The origin the isolation application is expecting messages from.
+  pub origin: String,
+  /// The function that processes the IPC message.
+  #[raw]
+  pub process_ipc_message_fn: &'a str,
 }
 
 #[cfg(test)]

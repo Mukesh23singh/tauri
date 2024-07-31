@@ -1,4 +1,4 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2019-2024 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
@@ -7,26 +7,27 @@ use std::{
   env::var,
   fs::{create_dir_all, File},
   io::{BufWriter, Write},
-  path::PathBuf,
+  path::{Path, PathBuf},
 };
 use tauri_codegen::{context_codegen, ContextData};
+use tauri_utils::config::FrontendDist;
 
 // TODO docs
 /// A builder for generating a Tauri application context during compile time.
-#[cfg_attr(doc_cfg, doc(cfg(feature = "codegen")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "codegen")))]
 #[derive(Debug)]
 pub struct CodegenContext {
-  dev: bool,
   config_path: PathBuf,
   out_file: PathBuf,
+  capabilities: Option<Vec<PathBuf>>,
 }
 
 impl Default for CodegenContext {
   fn default() -> Self {
     Self {
-      dev: false,
       config_path: PathBuf::from("tauri.conf.json"),
       out_file: PathBuf::from("tauri-build-context.rs"),
+      capabilities: None,
     }
   }
 }
@@ -52,24 +53,26 @@ impl CodegenContext {
   ///
   /// **Note:** This path should be relative to the `OUT_DIR`.
   ///
-  /// Don't set this if you are using [`tauri::include_codegen_context!`] as that helper macro
+  /// Don't set this if you are using [`tauri::tauri_build_context!`] as that helper macro
   /// expects the default value. This option can be useful if you are not using the helper and
   /// instead using [`std::include!`] on the generated code yourself.
   ///
   /// Defaults to `tauri-build-context.rs`.
   ///
-  /// [`tauri::include_codegen_context!`]: https://docs.rs/tauri/0.12/tauri/macro.include_codegen_context.html
+  /// [`tauri::tauri_build_context!`]: https://docs.rs/tauri/latest/tauri/macro.tauri_build_context.html
   #[must_use]
   pub fn out_file(mut self, filename: PathBuf) -> Self {
     self.out_file = filename;
     self
   }
 
-  /// Run the codegen in a `dev` context, meaning that Tauri is using a dev server or local file for development purposes,
-  /// usually with the `tauri dev` CLI command.
+  /// Adds a capability file to the generated context.
   #[must_use]
-  pub fn dev(mut self) -> Self {
-    self.dev = true;
+  pub fn capability<P: AsRef<Path>>(mut self, path: P) -> Self {
+    self
+      .capabilities
+      .get_or_insert_with(Default::default)
+      .push(path.as_ref().to_path_buf());
     self
   }
 
@@ -77,28 +80,58 @@ impl CodegenContext {
   ///
   /// Unless you are doing something special with this builder, you don't need to do anything with
   /// the returned output path.
-  ///
-  /// # Panics
-  ///
-  /// If any parts of the codegen fail, this will panic with the related error message. This is
-  /// typically desirable when running inside a build script; see [`Self::try_build`] for no panics.
-  pub fn build(self) -> PathBuf {
-    match self.try_build() {
-      Ok(out) => out,
-      Err(error) => panic!("Error found during Codegen::build: {}", error),
-    }
-  }
-
-  /// Non-panicking [`Self::build`]
-  pub fn try_build(self) -> Result<PathBuf> {
+  pub(crate) fn try_build(self) -> Result<PathBuf> {
     let (config, config_parent) = tauri_codegen::get_config(&self.config_path)?;
+
+    // rerun if changed
+    match &config.build.frontend_dist {
+      Some(FrontendDist::Directory(p)) => {
+        let dist_path = config_parent.join(p);
+        if dist_path.exists() {
+          println!("cargo:rerun-if-changed={}", dist_path.display());
+        }
+      }
+      Some(FrontendDist::Files(files)) => {
+        for path in files {
+          println!(
+            "cargo:rerun-if-changed={}",
+            config_parent.join(path).display()
+          );
+        }
+      }
+      _ => (),
+    }
+    for icon in &config.bundle.icon {
+      println!(
+        "cargo:rerun-if-changed={}",
+        config_parent.join(icon).display()
+      );
+    }
+    if let Some(tray_icon) = config.app.tray_icon.as_ref().map(|t| &t.icon_path) {
+      println!(
+        "cargo:rerun-if-changed={}",
+        config_parent.join(tray_icon).display()
+      );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+      let info_plist_path = config_parent.join("Info.plist");
+      if info_plist_path.exists() {
+        println!("cargo:rerun-if-changed={}", info_plist_path.display());
+      }
+    }
+
     let code = context_codegen(ContextData {
-      dev: self.dev,
+      dev: crate::is_dev(),
       config,
       config_parent,
       // it's very hard to have a build script for unit tests, so assume this is always called from
       // outside the tauri crate, making the ::tauri root valid.
-      root: quote::quote!(::tauri::Context),
+      root: quote::quote!(::tauri),
+      capabilities: self.capabilities,
+      assets: None,
+      test: false,
     })?;
 
     // get the full output file path
@@ -120,7 +153,7 @@ impl CodegenContext {
       )
     })?;
 
-    writeln!(file, "{}", code).with_context(|| {
+    writeln!(file, "{code}").with_context(|| {
       format!(
         "Unable to write tokenstream to out file during tauri-build {}",
         out.display()

@@ -1,14 +1,16 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2019-2024 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
 use crate::{
-  command::{CommandArg, CommandItem},
-  InvokeError, Runtime,
+  ipc::{CommandArg, CommandItem, InvokeError},
+  Runtime,
 };
-use state::Container;
+use state::TypeMap;
 
 /// A guard for a state value.
+///
+/// See [`Manager::manage`](`crate::Manager::manage`) for usage examples.
 pub struct State<'r, T: Send + Sync + 'static>(&'r T);
 
 impl<'r, T: Send + Sync + 'static> State<'r, T> {
@@ -47,7 +49,7 @@ impl<'r, 'de: 'r, T: Send + Sync + 'static, R: Runtime> CommandArg<'de, R> for S
   fn from_command(command: CommandItem<'de, R>) -> Result<Self, InvokeError> {
     Ok(command.message.state_ref().try_get().unwrap_or_else(|| {
       panic!(
-        "state not managed for field `{}` on command `{}`. You muse call `.manage()` before using this command",
+        "state not managed for field `{}` on command `{}`. You must call `.manage()` before using this command",
         command.key, command.name
       )
     }))
@@ -56,11 +58,11 @@ impl<'r, 'de: 'r, T: Send + Sync + 'static, R: Runtime> CommandArg<'de, R> for S
 
 /// The Tauri state manager.
 #[derive(Debug)]
-pub struct StateManager(pub(crate) Container![Send + Sync]);
+pub struct StateManager(pub(crate) TypeMap![Send + Sync]);
 
 impl StateManager {
   pub(crate) fn new() -> Self {
-    Self(<Container![Send + Sync]>::new())
+    Self(<TypeMap![Send + Sync]>::new())
   }
 
   pub(crate) fn set<T: Send + Sync + 'static>(&self, state: T) -> bool {
@@ -69,7 +71,6 @@ impl StateManager {
 
   /// Gets the state associated with the specified type.
   pub fn get<T: Send + Sync + 'static>(&self) -> State<'_, T> {
-    self.0.get::<T>();
     State(
       self
         .0

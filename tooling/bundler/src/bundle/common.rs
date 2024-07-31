@@ -1,22 +1,21 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2016-2019 Cargo-Bundle developers <https://github.com/burtonageo/cargo-bundle>
+// Copyright 2019-2024 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
-
-use log::debug;
 
 use std::{
   ffi::OsStr,
   fs::{self, File},
-  io::{self, BufReader, BufWriter},
+  io::{self, BufRead, BufReader, BufWriter},
   path::Path,
-  process::{Command, Output, Stdio},
+  process::{Command, ExitStatus, Output, Stdio},
   sync::{Arc, Mutex},
 };
 
 /// Returns true if the path has a filename indicating that it is a high-density
-/// "retina" icon.  Specifically, returns true the the file stem ends with
+/// "retina" icon.  Specifically, returns true the file stem ends with
 /// "@2x" (a convention specified by the [Apple developer docs](
-/// https://developer.apple.com/library/mac/documentation/GraphicsAnimation/Conceptual/HighResolutionOSX/Optimizing/Optimizing.html)).
+/// <https://developer.apple.com/library/mac/documentation/GraphicsAnimation/Conceptual/HighResolutionOSX/Optimizing/Optimizing.html>)).
 #[allow(dead_code)]
 pub fn is_retina<P: AsRef<Path>>(path: P) -> bool {
   path
@@ -31,7 +30,7 @@ pub fn is_retina<P: AsRef<Path>>(path: P) -> bool {
 /// needed.
 pub fn create_file(path: &Path) -> crate::Result<BufWriter<File>> {
   if let Some(parent) = path.parent() {
-    fs::create_dir_all(&parent)?;
+    fs::create_dir_all(parent)?;
   }
   let file = File::create(path)?;
   Ok(BufWriter::new(file))
@@ -71,14 +70,12 @@ pub fn copy_file(from: impl AsRef<Path>, to: impl AsRef<Path>) -> crate::Result<
   let to = to.as_ref();
   if !from.exists() {
     return Err(crate::Error::GenericError(format!(
-      "{:?} does not exist",
-      from
+      "{from:?} does not exist"
     )));
   }
   if !from.is_file() {
     return Err(crate::Error::GenericError(format!(
-      "{:?} is not a file",
-      from
+      "{from:?} is not a file"
     )));
   }
   let dest_dir = to.parent().expect("No data in parent");
@@ -95,21 +92,16 @@ pub fn copy_file(from: impl AsRef<Path>, to: impl AsRef<Path>) -> crate::Result<
 pub fn copy_dir(from: &Path, to: &Path) -> crate::Result<()> {
   if !from.exists() {
     return Err(crate::Error::GenericError(format!(
-      "{:?} does not exist",
-      from
+      "{from:?} does not exist"
     )));
   }
   if !from.is_dir() {
     return Err(crate::Error::GenericError(format!(
-      "{:?} is not a Directory",
-      from
+      "{from:?} is not a Directory"
     )));
   }
   if to.exists() {
-    return Err(crate::Error::GenericError(format!(
-      "{:?} already exists",
-      from
-    )));
+    return Err(crate::Error::GenericError(format!("{to:?} already exists")));
   }
   let parent = to.parent().expect("No data in parent");
   fs::create_dir_all(parent)?;
@@ -134,14 +126,59 @@ pub fn copy_dir(from: &Path, to: &Path) -> crate::Result<()> {
   Ok(())
 }
 
+/// Copies user-defined files specified in the configuration file to the package.
+///
+/// The configuration object maps the path in the package to the path of the file on the filesystem,
+/// relative to the tauri.conf.json file.
+///
+/// Expects a HashMap of PathBuf entries, representing destination and source paths,
+/// and also a path of a directory. The files will be stored with respect to this directory.
+#[cfg(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+))]
+pub fn copy_custom_files(
+  files_map: &std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
+  data_dir: &Path,
+) -> crate::Result<()> {
+  for (pkg_path, path) in files_map.iter() {
+    let pkg_path = if pkg_path.is_absolute() {
+      pkg_path.strip_prefix("/").unwrap()
+    } else {
+      pkg_path
+    };
+    if path.is_file() {
+      copy_file(path, data_dir.join(pkg_path))?;
+    } else {
+      copy_dir(path, &data_dir.join(pkg_path))?;
+    }
+  }
+  Ok(())
+}
+
 pub trait CommandExt {
+  // The `pipe` function sets the stdout and stderr to properly
+  // show the command output in the Node.js wrapper.
+  fn piped(&mut self) -> std::io::Result<ExitStatus>;
   fn output_ok(&mut self) -> crate::Result<Output>;
 }
 
 impl CommandExt for Command {
+  fn piped(&mut self) -> std::io::Result<ExitStatus> {
+    self.stdout(os_pipe::dup_stdout()?);
+    self.stderr(os_pipe::dup_stderr()?);
+    let program = self.get_program().to_string_lossy().into_owned();
+    log::debug!(action = "Running"; "Command `{} {}`", program, self.get_args().map(|arg| arg.to_string_lossy()).fold(String::new(), |acc, arg| format!("{acc} {arg}")));
+
+    self.status().map_err(Into::into)
+  }
+
   fn output_ok(&mut self) -> crate::Result<Output> {
     let program = self.get_program().to_string_lossy().into_owned();
-    debug!(action = "Running"; "Command `{} {}`", program, self.get_args().map(|arg| arg.to_string_lossy()).fold(String::new(), |acc, arg| format!("{} {}", acc, arg)));
+    log::debug!(action = "Running"; "Command `{} {}`", program, self.get_args().map(|arg| arg.to_string_lossy()).fold(String::new(), |acc, arg| format!("{acc} {arg}")));
 
     self.stdout(Stdio::piped());
     self.stderr(Stdio::piped());
@@ -152,17 +189,18 @@ impl CommandExt for Command {
     let stdout_lines = Arc::new(Mutex::new(Vec::new()));
     let stdout_lines_ = stdout_lines.clone();
     std::thread::spawn(move || {
-      let mut buf = Vec::new();
+      let mut line = String::new();
       let mut lines = stdout_lines_.lock().unwrap();
       loop {
-        buf.clear();
-        match tauri_utils::io::read_line(&mut stdout, &mut buf) {
-          Ok(s) if s == 0 => break,
-          _ => (),
+        line.clear();
+        match stdout.read_line(&mut line) {
+          Ok(0) => break,
+          Ok(_) => {
+            log::debug!(action = "stdout"; "{}", line.trim_end());
+            lines.extend(line.as_bytes().to_vec());
+          }
+          Err(_) => (),
         }
-        debug!(action = "stdout"; "{}", String::from_utf8_lossy(&buf));
-        lines.extend(buf.clone());
-        lines.push(b'\n');
       }
     });
 
@@ -170,17 +208,18 @@ impl CommandExt for Command {
     let stderr_lines = Arc::new(Mutex::new(Vec::new()));
     let stderr_lines_ = stderr_lines.clone();
     std::thread::spawn(move || {
-      let mut buf = Vec::new();
+      let mut line = String::new();
       let mut lines = stderr_lines_.lock().unwrap();
       loop {
-        buf.clear();
-        match tauri_utils::io::read_line(&mut stderr, &mut buf) {
-          Ok(s) if s == 0 => break,
-          _ => (),
+        line.clear();
+        match stderr.read_line(&mut line) {
+          Ok(0) => break,
+          Ok(_) => {
+            log::debug!(action = "stderr"; "{}", line.trim_end());
+            lines.extend(line.as_bytes().to_vec());
+          }
+          Err(_) => (),
         }
-        debug!(action = "stderr"; "{}", String::from_utf8_lossy(&buf));
-        lines.extend(buf.clone());
-        lines.push(b'\n');
       }
     });
 
@@ -195,8 +234,7 @@ impl CommandExt for Command {
       Ok(output)
     } else {
       Err(crate::Error::GenericError(format!(
-        "failed to run {}",
-        program
+        "failed to run {program}"
       )))
     }
   }

@@ -1,41 +1,11 @@
 {
-  "$schema": "../../../../../tooling/cli/schema.json",
+  "$schema": "../../../../../core/tauri-config-schema/schema.json",
+  "identifier": "com.tauri.dev",
   "build": {
-    "distDir": "../public",
-    "devPath": "../public",
-    "beforeDevCommand": "",
-    "beforeBuildCommand": "",
-    "withGlobalTauri": true
+    "frontendDist": "../public"
   },
-  "tauri": {
-    "bundle": {
-      "active": true,
-      "targets": "all",
-      "identifier": "com.tauri.dev",
-      "icon": [
-        "../../../../../examples/.icons/32x32.png",
-        "../../../../../examples/.icons/128x128.png",
-        "../../../../../examples/.icons/128x128@2x.png",
-        "../../../../../examples/.icons/icon.icns",
-        "../../../../../examples/.icons/icon.ico"
-      ],
-      "resources": [],
-      "externalBin": [],
-      "copyright": "",
-      "category": "DeveloperTool",
-      "shortDescription": "",
-      "longDescription": "",
-      "deb": {
-        "depends": []
-      },
-      "macOS": {
-        "frameworks": [],
-        "exceptionDomain": ""
-      }
-    },
-    "allowlist": {
-      "all": false
-    },
+  "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Welcome to Tauri!",
@@ -46,10 +16,18 @@
       }
     ],
     "security": {
-      "csp": "default-src blob: data: filesystem: ws: wss: http: https: tauri: 'unsafe-eval' 'unsafe-inline' 'self'"
-    },
-    "updater": {
-      "active": false
+      "csp": "default-src blob: data: filesystem: ws: wss: http: https: tauri: 'unsafe-eval' 'unsafe-inline' 'self'; connect-src ipc: http://ipc.localhost"
     }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "../../../../../examples/.icons/32x32.png",
+      "../../../../../examples/.icons/128x128.png",
+      "../../../../../examples/.icons/128x128@2x.png",
+      "../../../../../examples/.icons/icon.icns",
+      "../../../../../examples/.icons/icon.ico"
+    ]
   }
 }

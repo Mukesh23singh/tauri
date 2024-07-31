@@ -1,4 +1,5 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2016-2019 Cargo-Bundle developers <https://github.com/burtonageo/cargo-bundle>
+// Copyright 2019-2024 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
@@ -13,7 +14,7 @@ pub enum Error {
   #[error("{0}")]
   Resource(#[from] tauri_utils::Error),
   /// Bundler error.
-  #[error("{0}")]
+  #[error("{0:#}")]
   BundlerError(#[from] anyhow::Error),
   /// I/O error.
   #[error("`{0}`")]
@@ -21,9 +22,6 @@ pub enum Error {
   /// Image error.
   #[error("`{0}`")]
   ImageError(#[from] image::ImageError),
-  /// TOML error.
-  #[error("`{0}`")]
-  TomlError(#[from] toml::de::Error),
   /// Error walking directory.
   #[error("`{0}`")]
   WalkdirError(#[from] walkdir::Error),
@@ -34,11 +32,9 @@ pub enum Error {
   #[error("`{0}`")]
   ConvertError(#[from] num::TryFromIntError),
   /// Zip error.
-  #[cfg(target_os = "windows")]
   #[error("`{0}`")]
   ZipError(#[from] zip::result::ZipError),
   /// Hex error.
-  #[cfg(target_os = "windows")]
   #[error("`{0}`")]
   HexError(#[from] hex::FromHexError),
   /// Handlebars template error.
@@ -52,9 +48,8 @@ pub enum Error {
   #[error("`{0}`")]
   RegexError(#[from] regex::Error),
   /// Failed to perform HTTP request.
-  #[cfg(windows)]
   #[error("`{0}`")]
-  HttpError(#[from] attohttpc::Error),
+  HttpError(#[from] Box<ureq::Error>),
   /// Invalid glob pattern.
   #[cfg(windows)]
   #[error("{0}")]
@@ -72,6 +67,9 @@ pub enum Error {
   /// Couldn't find icons.
   #[error("Could not find Icon paths.  Please make sure they exist in the tauri config JSON file")]
   IconPathError,
+  /// Couldn't find background file.
+  #[error("Could not find background file. Make sure it exists in the tauri config JSON file and extension is png/jpg/gif")]
+  BackgroundPathError,
   /// Error on path util operation.
   #[error("Path Error:`{0}`")]
   PathUtilError(String),
@@ -96,6 +94,9 @@ pub enum Error {
   /// Failed to get registry value.
   #[error("failed to get {0} value on registry")]
   GetRegistryValue(String),
+  /// Failed to enumerate registry keys.
+  #[error("failed to enumerate registry keys")]
+  FailedToEnumerateRegKeys,
   /// Unsupported OS bitness.
   #[error("unsupported OS bitness")]
   UnsupportedBitness,
@@ -110,6 +111,10 @@ pub enum Error {
   #[cfg(target_os = "macos")]
   #[error(transparent)]
   Plist(#[from] plist::Error),
+  /// Rpm error.
+  #[cfg(target_os = "linux")]
+  #[error("{0}")]
+  RpmError(#[from] rpm::Error),
 }
 
 /// Convenient type alias of Result type.

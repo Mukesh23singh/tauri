@@ -1,21 +1,33 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2019-2024 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
 //! The Tauri plugin extension to expand Tauri functionality.
 
 use crate::{
-  utils::config::PluginConfig, AppHandle, Invoke, InvokeHandler, PageLoadPayload, RunEvent,
-  Runtime, Window,
+  app::UriSchemeResponder,
+  ipc::{Invoke, InvokeHandler, ScopeObject, ScopeValue},
+  manager::webview::UriSchemeProtocol,
+  utils::config::PluginConfig,
+  webview::PageLoadPayload,
+  AppHandle, Error, RunEvent, Runtime, Webview, Window,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 use tauri_macros::default_runtime;
+use thiserror::Error;
+use url::Url;
 
-use std::{collections::HashMap, fmt};
+use std::{
+  borrow::Cow,
+  collections::HashMap,
+  fmt::{self, Debug},
+  sync::Arc,
+};
 
-/// The result type of Tauri plugin module.
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+/// Mobile APIs.
+#[cfg(mobile)]
+pub mod mobile;
 
 /// The plugin interface.
 pub trait Plugin<R: Runtime>: Send {
@@ -24,26 +36,43 @@ pub trait Plugin<R: Runtime>: Send {
 
   /// Initializes the plugin.
   #[allow(unused_variables)]
-  fn initialize(&mut self, app: &AppHandle<R>, config: JsonValue) -> Result<()> {
+  fn initialize(
+    &mut self,
+    app: &AppHandle<R>,
+    config: JsonValue,
+  ) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
   }
 
-  /// The JS script to evaluate on webview initialization.
-  /// The script is wrapped into its own context with `(function () { /* your script here */ })();`,
-  /// so global variables must be assigned to `window` instead of implicity declared.
+  /// Add the provided JavaScript to a list of scripts that should be run after the global object has been created,
+  /// but before the HTML document has been parsed and before any other script included by the HTML document is run.
   ///
-  /// It's guaranteed that this script is executed before the page is loaded.
+  /// Since it runs on all top-level document and child frame page navigations,
+  /// it's recommended to check the `window.location` to guard your script from running on unexpected origins.
+  ///
+  /// The script is wrapped into its own context with `(function () { /* your script here */ })();`,
+  /// so global variables must be assigned to `window` instead of implicitly declared.
   fn initialization_script(&self) -> Option<String> {
     None
   }
 
+  /// Callback invoked when the window is created.
+  #[allow(unused_variables)]
+  fn window_created(&mut self, window: Window<R>) {}
+
   /// Callback invoked when the webview is created.
   #[allow(unused_variables)]
-  fn created(&mut self, window: Window<R>) {}
+  fn webview_created(&mut self, webview: Webview<R>) {}
+
+  /// Callback invoked when webview tries to navigate to the given Url. Returning falses cancels navigation.
+  #[allow(unused_variables)]
+  fn on_navigation(&mut self, webview: &Webview<R>, url: &Url) -> bool {
+    true
+  }
 
   /// Callback invoked when the webview performs a navigation to a page.
   #[allow(unused_variables)]
-  fn on_page_load(&mut self, window: Window<R>, payload: PageLoadPayload) {}
+  fn on_page_load(&mut self, webview: &Webview<R>, payload: &PageLoadPayload<'_>) {}
 
   /// Callback invoked when the event loop receives a new event.
   #[allow(unused_variables)]
@@ -51,14 +80,88 @@ pub trait Plugin<R: Runtime>: Send {
 
   /// Extend commands to [`crate::Builder::invoke_handler`].
   #[allow(unused_variables)]
-  fn extend_api(&mut self, invoke: Invoke<R>) {}
+  fn extend_api(&mut self, invoke: Invoke<R>) -> bool {
+    false
+  }
 }
 
-type SetupHook<R> = dyn FnOnce(&AppHandle<R>) -> Result<()> + Send;
-type SetupWithConfigHook<R, T> = dyn FnOnce(&AppHandle<R>, T) -> Result<()> + Send;
-type OnWebviewReady<R> = dyn FnMut(Window<R>) + Send;
+type SetupHook<R, C> =
+  dyn FnOnce(&AppHandle<R>, PluginApi<R, C>) -> Result<(), Box<dyn std::error::Error>> + Send;
+type OnWindowReady<R> = dyn FnMut(Window<R>) + Send;
+type OnWebviewReady<R> = dyn FnMut(Webview<R>) + Send;
 type OnEvent<R> = dyn FnMut(&AppHandle<R>, &RunEvent) + Send;
-type OnPageLoad<R> = dyn FnMut(Window<R>, PageLoadPayload) + Send;
+type OnNavigation<R> = dyn Fn(&Webview<R>, &Url) -> bool + Send;
+type OnPageLoad<R> = dyn FnMut(&Webview<R>, &PageLoadPayload<'_>) + Send;
+type OnDrop<R> = dyn FnOnce(AppHandle<R>) + Send;
+
+/// A handle to a plugin.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct PluginHandle<R: Runtime> {
+  name: &'static str,
+  handle: AppHandle<R>,
+}
+
+impl<R: Runtime> Clone for PluginHandle<R> {
+  fn clone(&self) -> Self {
+    Self {
+      name: self.name,
+      handle: self.handle.clone(),
+    }
+  }
+}
+
+impl<R: Runtime> PluginHandle<R> {
+  /// Returns the application handle.
+  pub fn app(&self) -> &AppHandle<R> {
+    &self.handle
+  }
+}
+
+/// Api exposed to the plugin setup hook.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct PluginApi<R: Runtime, C: DeserializeOwned> {
+  handle: AppHandle<R>,
+  name: &'static str,
+  raw_config: Arc<JsonValue>,
+  config: C,
+}
+
+impl<R: Runtime, C: DeserializeOwned> PluginApi<R, C> {
+  /// Returns the plugin configuration.
+  pub fn config(&self) -> &C {
+    &self.config
+  }
+
+  /// Returns the application handle.
+  pub fn app(&self) -> &AppHandle<R> {
+    &self.handle
+  }
+
+  /// Gets the global scope defined on the permissions that are part of the app ACL.
+  pub fn scope<T: ScopeObject>(&self) -> crate::Result<ScopeValue<T>> {
+    self
+      .handle
+      .manager
+      .runtime_authority
+      .lock()
+      .unwrap()
+      .scope_manager
+      .get_global_scope_typed(&self.handle, self.name)
+  }
+}
+
+/// Errors that can happen during [`Builder`].
+#[derive(Debug, Clone, Hash, PartialEq, Error)]
+#[non_exhaustive]
+pub enum BuilderError {
+  /// Plugin attempted to use a reserved name.
+  #[error("plugin uses reserved name: {0}")]
+  ReservedName(String),
+}
+
+const RESERVED_PLUGIN_NAMES: &[&str] = &["core", "tauri"];
 
 /// Builds a [`TauriPlugin`].
 ///
@@ -122,7 +225,7 @@ type OnPageLoad<R> = dyn FnMut(Window<R>, PageLoadPayload) + Send;
 ///
 ///   pub fn build<R: Runtime>(self) -> TauriPlugin<R> {
 ///     PluginBuilder::new("example")
-///       .setup(move |app_handle| {
+///       .setup(move |app_handle, api| {
 ///         // use the options here to do stuff
 ///         println!("a: {}, b: {}, c: {}", self.option_a, self.option_b, self.option_c);
 ///
@@ -135,12 +238,15 @@ type OnPageLoad<R> = dyn FnMut(Window<R>, PageLoadPayload) + Send;
 pub struct Builder<R: Runtime, C: DeserializeOwned = ()> {
   name: &'static str,
   invoke_handler: Box<InvokeHandler<R>>,
-  setup: Option<Box<SetupHook<R>>>,
-  setup_with_config: Option<Box<SetupWithConfigHook<R, C>>>,
+  setup: Option<Box<SetupHook<R, C>>>,
   js_init_script: Option<String>,
+  on_navigation: Box<OnNavigation<R>>,
   on_page_load: Box<OnPageLoad<R>>,
+  on_window_ready: Box<OnWindowReady<R>>,
   on_webview_ready: Box<OnWebviewReady<R>>,
   on_event: Box<OnEvent<R>>,
+  on_drop: Option<Box<OnDrop<R>>>,
+  uri_scheme_protocols: HashMap<String, Arc<UriSchemeProtocol<R>>>,
 }
 
 impl<R: Runtime, C: DeserializeOwned> Builder<R, C> {
@@ -149,12 +255,15 @@ impl<R: Runtime, C: DeserializeOwned> Builder<R, C> {
     Self {
       name,
       setup: None,
-      setup_with_config: None,
       js_init_script: None,
-      invoke_handler: Box::new(|_| ()),
+      invoke_handler: Box::new(|_| false),
+      on_navigation: Box::new(|_, _| true),
       on_page_load: Box::new(|_, _| ()),
+      on_window_ready: Box::new(|_| ()),
       on_webview_ready: Box::new(|_| ()),
       on_event: Box::new(|_, _| ()),
+      on_drop: None,
+      uri_scheme_protocols: Default::default(),
     }
   }
 
@@ -184,17 +293,22 @@ impl<R: Runtime, C: DeserializeOwned> Builder<R, C> {
   #[must_use]
   pub fn invoke_handler<F>(mut self, invoke_handler: F) -> Self
   where
-    F: Fn(Invoke<R>) + Send + Sync + 'static,
+    F: Fn(Invoke<R>) -> bool + Send + Sync + 'static,
   {
     self.invoke_handler = Box::new(invoke_handler);
     self
   }
 
-  /// The JS script to evaluate on webview initialization.
-  /// The script is wrapped into its own context with `(function () { /* your script here */ })();`,
-  /// so global variables must be assigned to `window` instead of implicity declared.
+  /// Sets the provided JavaScript to be run after the global object has been created,
+  /// but before the HTML document has been parsed and before any other script included by the HTML document is run.
   ///
-  /// It's guaranteed that this script is executed before the page is loaded.
+  /// Since it runs on all top-level document and child frame page navigations,
+  /// it's recommended to check the `window.location` to guard your script from running on unexpected origins.
+  ///
+  /// The script is wrapped into its own context with `(function () { /* your script here */ })();`,
+  /// so global variables must be assigned to `window` instead of implicitly declared.
+  ///
+  /// Note that calling this function multiple times overrides previous values.
   ///
   /// # Examples
   ///
@@ -202,9 +316,11 @@ impl<R: Runtime, C: DeserializeOwned> Builder<R, C> {
   /// use tauri::{plugin::{Builder, TauriPlugin}, Runtime};
   ///
   /// const INIT_SCRIPT: &str = r#"
-  ///    console.log("hello world from js init script");
+  ///   if (window.location.origin === 'https://tauri.app') {
+  ///     console.log("hello world from js init script");
   ///
-  ///   window.__MY_CUSTOM_PROPERTY__ = { foo: 'bar' }
+  ///     window.__MY_CUSTOM_PROPERTY__ = { foo: 'bar' };
+  ///   }
   /// "#;
   ///
   /// fn init<R: Runtime>() -> TauriPlugin<R> {
@@ -221,10 +337,6 @@ impl<R: Runtime, C: DeserializeOwned> Builder<R, C> {
 
   /// Define a closure that runs when the plugin is registered.
   ///
-  /// This is a convenience function around [setup_with_config], without the need to specify a configuration object.
-  ///
-  /// The closure gets called before the [setup_with_config] closure.
-  ///
   /// # Examples
   ///
   /// ```rust
@@ -238,58 +350,47 @@ impl<R: Runtime, C: DeserializeOwned> Builder<R, C> {
   ///
   /// fn init<R: Runtime>() -> TauriPlugin<R> {
   /// Builder::new("example")
-  ///   .setup(|app_handle| {
-  ///     app_handle.manage(PluginState::default());
+  ///   .setup(|app, api| {
+  ///     app.manage(PluginState::default());
   ///
   ///     Ok(())
   ///   })
   ///   .build()
   /// }
   /// ```
-  ///
-  /// [setup_with_config]: struct.Builder.html#method.setup_with_config
   #[must_use]
   pub fn setup<F>(mut self, setup: F) -> Self
   where
-    F: FnOnce(&AppHandle<R>) -> Result<()> + Send + 'static,
+    F: FnOnce(&AppHandle<R>, PluginApi<R, C>) -> Result<(), Box<dyn std::error::Error>>
+      + Send
+      + 'static,
   {
     self.setup.replace(Box::new(setup));
     self
   }
 
-  /// Define a closure that runs when the plugin is registered, accepting a configuration object set on `tauri.conf.json > plugins > yourPluginName`.
+  /// Callback invoked when the webview tries to navigate to a URL. Returning false cancels the navigation.
   ///
-  /// If your plugin is not pulling a configuration object from `tauri.conf.json`, use [setup].
+  /// #Example
   ///
-  /// The closure gets called after the [setup] closure.
+  /// ```
+  /// use tauri::{plugin::{Builder, TauriPlugin}, Runtime};
   ///
-  /// # Examples
-  ///
-  /// ```rust,no_run
-  /// #[derive(serde::Deserialize)]
-  /// struct Config {
-  ///   api_url: String,
-  /// }
-  ///
-  /// fn init<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R, Config> {
-  ///   tauri::plugin::Builder::<R, Config>::new("api")
-  ///     .setup_with_config(|_app_handle, config| {
-  ///       println!("config: {:?}", config.api_url);
-  ///       Ok(())
+  /// fn init<R: Runtime>() -> TauriPlugin<R> {
+  ///   Builder::new("example")
+  ///     .on_navigation(|webview, url| {
+  ///       // allow the production URL or localhost on dev
+  ///       url.scheme() == "tauri" || (cfg!(dev) && url.host_str() == Some("localhost"))
   ///     })
   ///     .build()
   /// }
-  ///
-  /// tauri::Builder::default().plugin(init());
   /// ```
-  ///
-  /// [setup]: struct.Builder.html#method.setup
   #[must_use]
-  pub fn setup_with_config<F>(mut self, setup_with_config: F) -> Self
+  pub fn on_navigation<F>(mut self, on_navigation: F) -> Self
   where
-    F: FnOnce(&AppHandle<R>, C) -> Result<()> + Send + 'static,
+    F: Fn(&Webview<R>, &Url) -> bool + Send + 'static,
   {
-    self.setup_with_config.replace(Box::new(setup_with_config));
+    self.on_navigation = Box::new(on_navigation);
     self
   }
 
@@ -302,8 +403,8 @@ impl<R: Runtime, C: DeserializeOwned> Builder<R, C> {
   ///
   /// fn init<R: Runtime>() -> TauriPlugin<R> {
   ///   Builder::new("example")
-  ///     .on_page_load(|window, payload| {
-  ///       println!("Loaded URL {} in window {}", payload.url(), window.label());
+  ///     .on_page_load(|webview, payload| {
+  ///       println!("{:?} URL {} in webview {}", payload.event(), payload.url(), webview.label());
   ///     })
   ///     .build()
   /// }
@@ -311,9 +412,33 @@ impl<R: Runtime, C: DeserializeOwned> Builder<R, C> {
   #[must_use]
   pub fn on_page_load<F>(mut self, on_page_load: F) -> Self
   where
-    F: FnMut(Window<R>, PageLoadPayload) + Send + Sync + 'static,
+    F: FnMut(&Webview<R>, &PageLoadPayload<'_>) + Send + 'static,
   {
     self.on_page_load = Box::new(on_page_load);
+    self
+  }
+
+  /// Callback invoked when the window is created.
+  ///
+  /// # Examples
+  ///
+  /// ```rust
+  /// use tauri::{plugin::{Builder, TauriPlugin}, Runtime};
+  ///
+  /// fn init<R: Runtime>() -> TauriPlugin<R> {
+  ///   Builder::new("example")
+  ///     .on_window_ready(|window| {
+  ///       println!("created window {}", window.label());
+  ///     })
+  ///     .build()
+  /// }
+  /// ```
+  #[must_use]
+  pub fn on_window_ready<F>(mut self, on_window_ready: F) -> Self
+  where
+    F: FnMut(Window<R>) + Send + 'static,
+  {
+    self.on_window_ready = Box::new(on_window_ready);
     self
   }
 
@@ -326,8 +451,8 @@ impl<R: Runtime, C: DeserializeOwned> Builder<R, C> {
   ///
   /// fn init<R: Runtime>() -> TauriPlugin<R> {
   ///   Builder::new("example")
-  ///     .on_webview_ready(|window| {
-  ///       println!("created window {}", window.label());
+  ///     .on_webview_ready(|webview| {
+  ///       println!("created webview {}", webview.label());
   ///     })
   ///     .build()
   /// }
@@ -335,7 +460,7 @@ impl<R: Runtime, C: DeserializeOwned> Builder<R, C> {
   #[must_use]
   pub fn on_webview_ready<F>(mut self, on_webview_ready: F) -> Self
   where
-    F: FnMut(Window<R>) + Send + Sync + 'static,
+    F: FnMut(Webview<R>) + Send + 'static,
   {
     self.on_webview_ready = Box::new(on_webview_ready);
     self
@@ -367,37 +492,196 @@ impl<R: Runtime, C: DeserializeOwned> Builder<R, C> {
   #[must_use]
   pub fn on_event<F>(mut self, on_event: F) -> Self
   where
-    F: FnMut(&AppHandle<R>, &RunEvent) + Send + Sync + 'static,
+    F: FnMut(&AppHandle<R>, &RunEvent) + Send + 'static,
   {
     self.on_event = Box::new(on_event);
     self
   }
 
-  /// Builds the [TauriPlugin].
-  pub fn build(self) -> TauriPlugin<R, C> {
-    TauriPlugin {
+  /// Callback invoked when the plugin is dropped.
+  ///
+  /// # Examples
+  ///
+  /// ```rust
+  /// use tauri::{plugin::{Builder, TauriPlugin}, Runtime};
+  ///
+  /// fn init<R: Runtime>() -> TauriPlugin<R> {
+  ///   Builder::new("example")
+  ///     .on_drop(|app| {
+  ///       println!("plugin has been dropped and is no longer running");
+  ///       // you can run cleanup logic here
+  ///     })
+  ///     .build()
+  /// }
+  /// ```
+  #[must_use]
+  pub fn on_drop<F>(mut self, on_drop: F) -> Self
+  where
+    F: FnOnce(AppHandle<R>) + Send + 'static,
+  {
+    self.on_drop.replace(Box::new(on_drop));
+    self
+  }
+
+  /// Registers a URI scheme protocol available to all webviews.
+  /// Leverages [setURLSchemeHandler](https://developer.apple.com/documentation/webkit/wkwebviewconfiguration/2875766-seturlschemehandler) on macOS,
+  /// [AddWebResourceRequestedFilter](https://docs.microsoft.com/en-us/dotnet/api/microsoft.web.webview2.core.corewebview2.addwebresourcerequestedfilter?view=webview2-dotnet-1.0.774.44) on Windows
+  /// and [webkit-web-context-register-uri-scheme](https://webkitgtk.org/reference/webkit2gtk/stable/WebKitWebContext.html#webkit-web-context-register-uri-scheme) on Linux.
+  ///
+  /// # Known limitations
+  ///
+  /// URI scheme protocols are registered when the webview is created. Due to this limitation, if the plugin is registered after a webview has been created, this protocol won't be available.
+  ///
+  /// # Arguments
+  ///
+  /// * `uri_scheme` The URI scheme to register, such as `example`.
+  /// * `protocol` the protocol associated with the given URI scheme. It's a function that takes an URL such as `example://localhost/asset.css`.
+  ///
+  /// # Examples
+  ///
+  /// ```rust
+  /// use tauri::{plugin::{Builder, TauriPlugin}, Runtime};
+  ///
+  /// fn init<R: Runtime>() -> TauriPlugin<R> {
+  ///   Builder::new("myplugin")
+  ///     .register_uri_scheme_protocol("myscheme", |app, req| {
+  ///       http::Response::builder().body(Vec::new()).unwrap()
+  ///     })
+  ///     .build()
+  /// }
+  /// ```
+  #[must_use]
+  pub fn register_uri_scheme_protocol<
+    N: Into<String>,
+    T: Into<Cow<'static, [u8]>>,
+    H: Fn(&AppHandle<R>, http::Request<Vec<u8>>) -> http::Response<T> + Send + Sync + 'static,
+  >(
+    mut self,
+    uri_scheme: N,
+    protocol: H,
+  ) -> Self {
+    self.uri_scheme_protocols.insert(
+      uri_scheme.into(),
+      Arc::new(UriSchemeProtocol {
+        protocol: Box::new(move |app, request, responder| {
+          responder.respond(protocol(app, request))
+        }),
+      }),
+    );
+    self
+  }
+
+  /// Similar to [`Self::register_uri_scheme_protocol`] but with an asynchronous responder that allows you
+  /// to process the request in a separate thread and respond asynchronously.
+  ///
+  /// # Arguments
+  ///
+  /// * `uri_scheme` The URI scheme to register, such as `example`.
+  /// * `protocol` the protocol associated with the given URI scheme. It's a function that takes an URL such as `example://localhost/asset.css`.
+  ///
+  /// # Examples
+  ///
+  /// ```rust
+  /// use tauri::{plugin::{Builder, TauriPlugin}, Runtime};
+  ///
+  /// fn init<R: Runtime>() -> TauriPlugin<R> {
+  ///   Builder::new("myplugin")
+  ///     .register_asynchronous_uri_scheme_protocol("app-files", |_app, request, responder| {
+  ///       // skip leading `/`
+  ///       let path = request.uri().path()[1..].to_string();
+  ///       std::thread::spawn(move || {
+  ///         if let Ok(data) = std::fs::read(path) {
+  ///           responder.respond(
+  ///             http::Response::builder()
+  ///               .body(data)
+  ///               .unwrap()
+  ///           );
+  ///         } else {
+  ///           responder.respond(
+  ///             http::Response::builder()
+  ///               .status(http::StatusCode::BAD_REQUEST)
+  ///               .header(http::header::CONTENT_TYPE, mime::TEXT_PLAIN.essence_str())
+  ///               .body("failed to read file".as_bytes().to_vec())
+  ///               .unwrap()
+  ///           );
+  ///         }
+  ///       });
+  ///     })
+  ///     .build()
+  /// }
+  /// ```
+  #[must_use]
+  pub fn register_asynchronous_uri_scheme_protocol<
+    N: Into<String>,
+    H: Fn(&AppHandle<R>, http::Request<Vec<u8>>, UriSchemeResponder) + Send + Sync + 'static,
+  >(
+    mut self,
+    uri_scheme: N,
+    protocol: H,
+  ) -> Self {
+    self.uri_scheme_protocols.insert(
+      uri_scheme.into(),
+      Arc::new(UriSchemeProtocol {
+        protocol: Box::new(protocol),
+      }),
+    );
+    self
+  }
+
+  /// Builds the [`TauriPlugin`].
+  pub fn try_build(self) -> Result<TauriPlugin<R, C>, BuilderError> {
+    if let Some(&reserved) = RESERVED_PLUGIN_NAMES.iter().find(|&r| r == &self.name) {
+      return Err(BuilderError::ReservedName(reserved.into()));
+    }
+
+    Ok(TauriPlugin {
       name: self.name,
+      app: None,
       invoke_handler: self.invoke_handler,
       setup: self.setup,
-      setup_with_config: self.setup_with_config,
       js_init_script: self.js_init_script,
+      on_navigation: self.on_navigation,
       on_page_load: self.on_page_load,
+      on_window_ready: self.on_window_ready,
       on_webview_ready: self.on_webview_ready,
       on_event: self.on_event,
-    }
+      on_drop: self.on_drop,
+      uri_scheme_protocols: self.uri_scheme_protocols,
+    })
+  }
+
+  /// Builds the [`TauriPlugin`].
+  ///
+  /// # Panics
+  ///
+  /// If the builder returns an error during [`Self::try_build`], then this method will panic.
+  pub fn build(self) -> TauriPlugin<R, C> {
+    self.try_build().expect("valid plugin")
   }
 }
 
 /// Plugin struct that is returned by the [`Builder`]. Should only be constructed through the builder.
 pub struct TauriPlugin<R: Runtime, C: DeserializeOwned = ()> {
   name: &'static str,
+  app: Option<AppHandle<R>>,
   invoke_handler: Box<InvokeHandler<R>>,
-  setup: Option<Box<SetupHook<R>>>,
-  setup_with_config: Option<Box<SetupWithConfigHook<R, C>>>,
+  setup: Option<Box<SetupHook<R, C>>>,
   js_init_script: Option<String>,
+  on_navigation: Box<OnNavigation<R>>,
   on_page_load: Box<OnPageLoad<R>>,
+  on_window_ready: Box<OnWindowReady<R>>,
   on_webview_ready: Box<OnWebviewReady<R>>,
   on_event: Box<OnEvent<R>>,
+  on_drop: Option<Box<OnDrop<R>>>,
+  uri_scheme_protocols: HashMap<String, Arc<UriSchemeProtocol<R>>>,
+}
+
+impl<R: Runtime, C: DeserializeOwned> Drop for TauriPlugin<R, C> {
+  fn drop(&mut self) {
+    if let (Some(on_drop), Some(app)) = (self.on_drop.take(), self.app.take()) {
+      on_drop(app);
+    }
+  }
 }
 
 impl<R: Runtime, C: DeserializeOwned> Plugin<R> for TauriPlugin<R, C> {
@@ -405,12 +689,34 @@ impl<R: Runtime, C: DeserializeOwned> Plugin<R> for TauriPlugin<R, C> {
     self.name
   }
 
-  fn initialize(&mut self, app: &AppHandle<R>, config: JsonValue) -> Result<()> {
+  fn initialize(
+    &mut self,
+    app: &AppHandle<R>,
+    config: JsonValue,
+  ) -> Result<(), Box<dyn std::error::Error>> {
+    self.app.replace(app.clone());
     if let Some(s) = self.setup.take() {
-      (s)(app)?;
+      (s)(
+        app,
+        PluginApi {
+          name: self.name,
+          handle: app.clone(),
+          raw_config: Arc::new(config.clone()),
+          config: serde_json::from_value(config).map_err(|err| {
+            format!(
+              "Error deserializing 'plugins.{}' within your Tauri configuration: {err}",
+              self.name
+            )
+          })?,
+        },
+      )?;
     }
-    if let Some(s) = self.setup_with_config.take() {
-      (s)(app, serde_json::from_value(config)?)?;
+
+    for (uri_scheme, protocol) in &self.uri_scheme_protocols {
+      app
+        .manager
+        .webview
+        .register_uri_scheme_protocol(uri_scheme, protocol.clone())
     }
     Ok(())
   }
@@ -419,19 +725,27 @@ impl<R: Runtime, C: DeserializeOwned> Plugin<R> for TauriPlugin<R, C> {
     self.js_init_script.clone()
   }
 
-  fn created(&mut self, window: Window<R>) {
-    (self.on_webview_ready)(window)
+  fn window_created(&mut self, window: Window<R>) {
+    (self.on_window_ready)(window)
   }
 
-  fn on_page_load(&mut self, window: Window<R>, payload: PageLoadPayload) {
-    (self.on_page_load)(window, payload)
+  fn webview_created(&mut self, webview: Webview<R>) {
+    (self.on_webview_ready)(webview)
+  }
+
+  fn on_navigation(&mut self, webview: &Webview<R>, url: &Url) -> bool {
+    (self.on_navigation)(webview, url)
+  }
+
+  fn on_page_load(&mut self, webview: &Webview<R>, payload: &PageLoadPayload<'_>) {
+    (self.on_page_load)(webview, payload)
   }
 
   fn on_event(&mut self, app: &AppHandle<R>, event: &RunEvent) {
     (self.on_event)(app, event)
   }
 
-  fn extend_api(&mut self, invoke: Invoke<R>) {
+  fn extend_api(&mut self, invoke: Invoke<R>) -> bool {
     (self.invoke_handler)(invoke)
   }
 }
@@ -439,22 +753,21 @@ impl<R: Runtime, C: DeserializeOwned> Plugin<R> for TauriPlugin<R, C> {
 /// Plugin collection type.
 #[default_runtime(crate::Wry, wry)]
 pub(crate) struct PluginStore<R: Runtime> {
-  store: HashMap<&'static str, Box<dyn Plugin<R>>>,
+  store: Vec<Box<dyn Plugin<R>>>,
 }
 
 impl<R: Runtime> fmt::Debug for PluginStore<R> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let plugins: Vec<&str> = self.store.iter().map(|plugins| plugins.name()).collect();
     f.debug_struct("PluginStore")
-      .field("plugins", &self.store.keys())
+      .field("plugins", &plugins)
       .finish()
   }
 }
 
 impl<R: Runtime> Default for PluginStore<R> {
   fn default() -> Self {
-    Self {
-      store: HashMap::new(),
-    }
+    Self { store: Vec::new() }
   }
 }
 
@@ -462,77 +775,126 @@ impl<R: Runtime> PluginStore<R> {
   /// Adds a plugin to the store.
   ///
   /// Returns `true` if a plugin with the same name is already in the store.
-  pub fn register<P: Plugin<R> + 'static>(&mut self, plugin: P) -> bool {
-    self.store.insert(plugin.name(), Box::new(plugin)).is_some()
+  pub fn register(&mut self, plugin: Box<dyn Plugin<R>>) -> bool {
+    let len = self.store.len();
+    self.store.retain(|p| p.name() != plugin.name());
+    let result = len != self.store.len();
+    self.store.push(plugin);
+    result
+  }
+
+  /// Removes the plugin with the given name from the store.
+  pub fn unregister(&mut self, plugin: &'static str) -> bool {
+    let len = self.store.len();
+    self.store.retain(|p| p.name() != plugin);
+    len != self.store.len()
+  }
+
+  /// Initializes the given plugin.
+  pub(crate) fn initialize(
+    &self,
+    plugin: &mut Box<dyn Plugin<R>>,
+    app: &AppHandle<R>,
+    config: &PluginConfig,
+  ) -> crate::Result<()> {
+    initialize(plugin, app, config)
   }
 
   /// Initializes all plugins in the store.
-  pub(crate) fn initialize(
+  pub(crate) fn initialize_all(
     &mut self,
     app: &AppHandle<R>,
     config: &PluginConfig,
   ) -> crate::Result<()> {
-    self.store.values_mut().try_for_each(|plugin| {
-      plugin
-        .initialize(
-          app,
-          config.0.get(plugin.name()).cloned().unwrap_or_default(),
-        )
-        .map_err(|e| crate::Error::PluginInitialization(plugin.name().to_string(), e.to_string()))
-    })
+    self
+      .store
+      .iter_mut()
+      .try_for_each(|plugin| initialize(plugin, app, config))
   }
 
   /// Generates an initialization script from all plugins in the store.
-  pub(crate) fn initialization_script(&self) -> String {
+  pub(crate) fn initialization_script(&self) -> Vec<String> {
     self
       .store
-      .values()
+      .iter()
       .filter_map(|p| p.initialization_script())
-      .fold(String::new(), |acc, script| {
-        format!("{}\n(function () {{ {} }})();", acc, script)
-      })
+      .map(|script| format!("(function () {{ {script} }})();"))
+      .collect()
   }
 
   /// Runs the created hook for all plugins in the store.
-  pub(crate) fn created(&mut self, window: Window<R>) {
+  pub(crate) fn window_created(&mut self, window: Window<R>) {
+    self.store.iter_mut().for_each(|plugin| {
+      #[cfg(feature = "tracing")]
+      let _span = tracing::trace_span!("plugin::hooks::created", name = plugin.name()).entered();
+      plugin.window_created(window.clone())
+    })
+  }
+
+  /// Runs the webview created hook for all plugins in the store.
+  pub(crate) fn webview_created(&mut self, webview: Webview<R>) {
     self
       .store
-      .values_mut()
-      .for_each(|plugin| plugin.created(window.clone()))
+      .iter_mut()
+      .for_each(|plugin| plugin.webview_created(webview.clone()))
+  }
+
+  pub(crate) fn on_navigation(&mut self, webview: &Webview<R>, url: &Url) -> bool {
+    for plugin in self.store.iter_mut() {
+      #[cfg(feature = "tracing")]
+      let _span =
+        tracing::trace_span!("plugin::hooks::on_navigation", name = plugin.name()).entered();
+      if !plugin.on_navigation(webview, url) {
+        return false;
+      }
+    }
+    true
   }
 
   /// Runs the on_page_load hook for all plugins in the store.
-  pub(crate) fn on_page_load(&mut self, window: Window<R>, payload: PageLoadPayload) {
-    self
-      .store
-      .values_mut()
-      .for_each(|plugin| plugin.on_page_load(window.clone(), payload.clone()))
+  pub(crate) fn on_page_load(&mut self, webview: &Webview<R>, payload: &PageLoadPayload<'_>) {
+    self.store.iter_mut().for_each(|plugin| {
+      #[cfg(feature = "tracing")]
+      let _span =
+        tracing::trace_span!("plugin::hooks::on_page_load", name = plugin.name()).entered();
+      plugin.on_page_load(webview, payload)
+    })
   }
 
   /// Runs the on_event hook for all plugins in the store.
   pub(crate) fn on_event(&mut self, app: &AppHandle<R>, event: &RunEvent) {
     self
       .store
-      .values_mut()
+      .iter_mut()
       .for_each(|plugin| plugin.on_event(app, event))
   }
 
-  pub(crate) fn extend_api(&mut self, mut invoke: Invoke<R>) {
-    let command = invoke.message.command.replace("plugin:", "");
-    let mut tokens = command.split('|');
-    // safe to unwrap: split always has a least one item
-    let target = tokens.next().unwrap();
-
-    if let Some(plugin) = self.store.get_mut(target) {
-      invoke.message.command = tokens
-        .next()
-        .map(|c| c.to_string())
-        .unwrap_or_else(String::new);
-      plugin.extend_api(invoke);
-    } else {
-      invoke
-        .resolver
-        .reject(format!("plugin {} not found", target));
+  /// Runs the plugin `extend_api` hook if it exists. Returns whether the invoke message was handled or not.
+  ///
+  /// The message is not handled when the plugin exists **and** the command does not.
+  pub(crate) fn extend_api(&mut self, plugin: &str, invoke: Invoke<R>) -> bool {
+    for p in self.store.iter_mut() {
+      if p.name() == plugin {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::trace_span!("plugin::hooks::ipc", name = plugin).entered();
+        return p.extend_api(invoke);
+      }
     }
+    invoke.resolver.reject(format!("plugin {plugin} not found"));
+    true
   }
+}
+
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "plugin::hooks::initialize", skip(plugin, app), fields(name = plugin.name())))]
+fn initialize<R: Runtime>(
+  plugin: &mut Box<dyn Plugin<R>>,
+  app: &AppHandle<R>,
+  config: &PluginConfig,
+) -> crate::Result<()> {
+  plugin
+    .initialize(
+      app,
+      config.0.get(plugin.name()).cloned().unwrap_or_default(),
+    )
+    .map_err(|e| Error::PluginInitialization(plugin.name().to_string(), e.to_string()))
 }

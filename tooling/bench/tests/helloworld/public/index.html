@@ -2,7 +2,6 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Welcome to Tauri!</title>
   </head>
@@ -11,7 +10,7 @@
 
     <script>
       window.addEventListener('DOMContentLoaded', (event) =>
-        window.__TAURI__.invoke('app_loaded_successfully')
+        window.__TAURI__.core.invoke('app_loaded_successfully')
       )
     </script>
   </body>

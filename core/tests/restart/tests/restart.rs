@@ -1,4 +1,4 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2019-2024 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
@@ -9,7 +9,7 @@ use std::process::Command;
 /// Helper for generic catch-all errors.
 type Result = std::result::Result<(), Box<dyn std::error::Error>>;
 
-/// https://docs.microsoft.com/en-us/windows/win32/debug/system-error-codes--1300-1699-
+/// <https://docs.microsoft.com/en-us/windows/win32/debug/system-error-codes--1300-1699->
 #[cfg(windows)]
 const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
 
@@ -32,7 +32,7 @@ fn symlink_runner(create_symlinks: impl Fn(&Path) -> io::Result<Symlink>) -> Res
   if cfg!(windows) {
     compiled_binary.set_extension("exe");
   }
-  println!("{:?}", compiled_binary);
+  println!("{compiled_binary:?}");
 
   // set up all the temporary file paths
   let temp = tempfile::TempDir::new()?;
@@ -45,7 +45,7 @@ fn symlink_runner(create_symlinks: impl Fn(&Path) -> io::Result<Symlink>) -> Res
     // run the command from the symlink, so that we can test if restart resolves it correctly
     let mut cmd = Command::new(link);
 
-    // add the restart parameter so that the invocation will call tauri::api::process::restart
+    // add the restart parameter so that the invocation will call tauri::process::restart
     cmd.arg("restart");
 
     let output = cmd.output()?;
@@ -55,7 +55,7 @@ fn symlink_runner(create_symlinks: impl Fn(&Path) -> io::Result<Symlink>) -> Res
 
     if output.status.success() {
       // gather the output into a string
-      let stdout = String::from_utf8(output.stdout)?;
+      let stdout = String::from_utf8_lossy(&output.stdout);
 
       // we expect the output to be the bin path, twice
       assert_eq!(stdout, format!("{bin}\n{bin}\n", bin = bin.display()));
@@ -64,7 +64,7 @@ fn symlink_runner(create_symlinks: impl Fn(&Path) -> io::Result<Symlink>) -> Res
       not(feature = "process-relaunch-dangerous-allow-symlink-macos")
     )) {
       // we expect this to fail on macOS without the dangerous symlink flag set
-      let stderr = String::from_utf8(output.stderr)?;
+      let stderr = String::from_utf8_lossy(&output.stderr);
 
       // make sure it's the error that we expect
       assert!(stderr.contains(

@@ -1,8 +1,9 @@
 {
   "extends": ["config:base"],
+  "baseBranches": ["dev", "1.x"],
   "schedule": "after 3am on Wednesday",
   "ignorePaths": [],
-  "labels": ["chore"],
+  "labels": ["type: chore"],
   "enabledManagers": ["cargo", "npm"],
   "cargo": {
     "enabled": true
@@ -21,7 +22,8 @@
       "lockFileMaintenance": {
         "enabled": true
       },
-      "rebaseConflictedPrs": false
+      "rebaseConflictedPrs": false,
+      "ignoreDeps": ["cargo_toml", "toml"]
     },
     {
       "enabled": true,
@@ -32,7 +34,8 @@
       "lockFileMaintenance": {
         "enabled": true
       },
-      "rebaseConflictedPrs": false
+      "rebaseConflictedPrs": false,
+      "ignoreDeps": ["cargo_toml"]
     },
     {
       "enabled": true,
@@ -76,7 +79,9 @@
       "lockFileMaintenance": {
         "enabled": true
       },
-      "rebaseConflictedPrs": false
+      "rebaseConflictedPrs": false,
+      "matchManagers": ["cargo"],
+      "ignoreDeps": ["minisign"]
     },
     {
       "enabled": true,

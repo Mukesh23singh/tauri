@@ -1,15 +1,18 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2016-2019 Cargo-Bundle developers <https://github.com/burtonageo/cargo-bundle>
+// Copyright 2019-2024 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
 use super::{
-  super::{common::CommandExt, path_utils},
+  super::{
+    common::{self, CommandExt},
+    path_utils,
+  },
   debian,
 };
 use crate::Settings;
 use anyhow::Context;
 use handlebars::Handlebars;
-use log::info;
 use std::{
   collections::BTreeMap,
   fs::{remove_dir_all, write},
@@ -29,33 +32,32 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
   let package_dir = settings.project_out_directory().join("bundle/appimage_deb");
 
   // generate deb_folder structure
-  let (_, icons) = debian::generate_data(settings, &package_dir)?;
-  let icons: Vec<debian::DebIcon> = icons.into_iter().collect();
+  let (data_dir, icons) = debian::generate_data(settings, &package_dir)
+    .with_context(|| "Failed to build data folders and files")?;
+  common::copy_custom_files(&settings.deb().files, &data_dir)
+    .with_context(|| "Failed to copy custom files")?;
 
   let output_path = settings.project_out_directory().join("bundle/appimage");
   if output_path.exists() {
     remove_dir_all(&output_path)?;
   }
   std::fs::create_dir_all(output_path.clone())?;
-  let app_dir_path = output_path.join(format!("{}.AppDir", settings.main_binary_name()));
+  let app_dir_path = output_path.join(format!("{}.AppDir", settings.product_name()));
   let appimage_filename = format!(
     "{}_{}_{}.AppImage",
-    settings.main_binary_name(),
+    settings.product_name(),
     settings.version_string(),
     arch
   );
   let appimage_path = output_path.join(&appimage_filename);
   path_utils::create(app_dir_path, true)?;
 
-  let upcase_app_name = settings.main_binary_name().to_uppercase();
-
   // setup data to insert into shell script
   let mut sh_map = BTreeMap::new();
   sh_map.insert("arch", settings.target().split('-').next().unwrap());
-  sh_map.insert("app_name", settings.main_binary_name());
-  sh_map.insert("app_name_uppercase", &upcase_app_name);
+  sh_map.insert("crate_name", settings.main_binary_name());
   sh_map.insert("appimage_filename", &appimage_filename);
-  let tauri_tools_path = dirs_next::cache_dir().map_or_else(
+  let tauri_tools_path = dirs::cache_dir().map_or_else(
     || output_path.to_path_buf(),
     |mut p| {
       p.push("tauri");
@@ -80,6 +82,7 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
 
   // initialize shell script template.
   let mut handlebars = Handlebars::new();
+  handlebars.register_escape_fn(handlebars::no_escape);
   handlebars
     .register_template_string("appimage", include_str!("templates/appimage"))
     .expect("Failed to register template for handlebars");
@@ -88,7 +91,7 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
   // create the shell script file in the target/ folder.
   let sh_file = output_path.join("build_appimage.sh");
 
-  info!(action = "Bundling"; "{} ({})", appimage_filename, appimage_path.display());
+  log::info!(action = "Bundling"; "{} ({})", appimage_filename, appimage_path.display());
 
   write(&sh_file, temp)?;
 
@@ -106,7 +109,7 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
   Command::new(&sh_file)
     .current_dir(output_path)
     .output_ok()
-    .context("error running appimage.sh")?;
+    .context("error running build_appimage.sh")?;
 
   remove_dir_all(&package_dir)?;
   Ok(vec![appimage_path])

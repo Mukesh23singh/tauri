@@ -1,8 +1,11 @@
-interface IPCMessage {
-  cmd: string
-  callback: number
-  error: number
-  [key: string]: unknown
+// Copyright 2019-2024 Tauri Programme within The Commons Conservancy
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
+
+import { InvokeArgs, InvokeOptions } from './core'
+
+function mockInternals() {
+  window.__TAURI_INTERNALS__ = window.__TAURI_INTERNALS__ ?? {}
 }
 
 /**
@@ -15,17 +18,17 @@ interface IPCMessage {
  * Testing setup using vitest:
  * ```js
  * import { mockIPC, clearMocks } from "@tauri-apps/api/mocks"
- * import { invoke } from "@tauri-apps/api/tauri"
+ * import { invoke } from "@tauri-apps/api/core"
  *
  * afterEach(() => {
  *    clearMocks()
  * })
  *
  * test("mocked command", () => {
- *  mockIPC((cmd, args) => {
+ *  mockIPC((cmd, payload) => {
  *   switch (cmd) {
  *     case "add":
- *       return (args.a as number) + (args.b as number);
+ *       return (payload.a as number) + (payload.b as number);
  *     default:
  *       break;
  *     }
@@ -35,27 +38,65 @@ interface IPCMessage {
  * })
  * ```
  *
- * @param cb
+ * The callback function can also return a Promise:
+ * ```js
+ * import { mockIPC, clearMocks } from "@tauri-apps/api/mocks"
+ * import { invoke } from "@tauri-apps/api/core"
+ *
+ * afterEach(() => {
+ *    clearMocks()
+ * })
+ *
+ * test("mocked command", () => {
+ *  mockIPC((cmd, payload) => {
+ *   if(cmd === "get_data") {
+ *    return fetch("https://example.com/data.json")
+ *      .then((response) => response.json())
+ *   }
+ *  });
+ *
+ *  expect(invoke('get_data')).resolves.toBe({ foo: 'bar' });
+ * })
+ * ```
+ *
+ * @since 1.0.0
  */
 export function mockIPC(
-  cb: (cmd: string, args: Record<string, unknown>) => any
+  cb: <T>(cmd: string, payload?: InvokeArgs) => Promise<T>
 ): void {
-  // eslint-disable-next-line @typescript-eslint/no-misused-promises
-  window.__TAURI_IPC__ = async ({
-    cmd,
-    callback,
-    error,
-    ...args
-  }: IPCMessage) => {
-    try {
-      // @ts-expect-error The function key is dynamic and therefore not typed
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-call
-      window[`_${callback}`](await cb(cmd, args))
-    } catch (err) {
-      // @ts-expect-error The function key is dynamic and therefore not typed
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-call
-      window[`_${error}`](err)
-    }
+  mockInternals()
+
+  window.__TAURI_INTERNALS__.transformCallback = function transformCallback(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    callback?: (response: any) => void,
+    once = false
+  ) {
+    const identifier = window.crypto.getRandomValues(new Uint32Array(1))[0]
+    const prop = `_${identifier}`
+
+    Object.defineProperty(window, prop, {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      value: (result: any) => {
+        if (once) {
+          Reflect.deleteProperty(window, prop)
+        }
+
+        return callback && callback(result)
+      },
+      writable: false,
+      configurable: true
+    })
+
+    return identifier
+  }
+
+  window.__TAURI_INTERNALS__.invoke = function <T>(
+    cmd: string,
+    args?: InvokeArgs,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    options?: InvokeOptions
+  ): Promise<T> {
+    return cb(cmd, args)
   }
 }
 
@@ -70,11 +111,11 @@ export function mockIPC(
  *
  * ```js
  * import { mockWindows } from "@tauri-apps/api/mocks";
- * import { getCurrent } from "@tauri-apps/api/window";
+ * import { getCurrentWindow } from "@tauri-apps/api/window";
  *
  * mockWindows("main", "second", "third");
  *
- * const win = getCurrent();
+ * const win = getCurrentWindow();
  *
  * win.label // "main"
  * ```
@@ -85,33 +126,64 @@ export function mockIPC(
  * mockWindows("main", "second", "third");
  *
  * mockIPC((cmd, args) => {
- *  if (cmd === "tauri") {
- *    if (
- *      args?.__tauriModule === "Window" &&
- *      args?.message?.cmd === "manage" &&
- *      args?.message?.data?.cmd?.type === "close"
- *    ) {
- *      console.log('closing window!');
- *    }
+ *  if (cmd === "plugin:event|emit") {
+ *    console.log('emit event', args?.event, args?.payload);
  *  }
  * });
  *
- * const { getCurrent } = await import("@tauri-apps/api/window");
- *
- * const win = getCurrent();
- * await win.close(); // this will cause the mocked IPC handler to log to the console.
+ * const { emit } = await import("@tauri-apps/api/event");
+ * await emit('loaded'); // this will cause the mocked IPC handler to log to the console.
  * ```
  *
  * @param current Label of window this JavaScript context is running in.
  * @param additionalWindows Label of additional windows the app has.
+ *
+ * @since 1.0.0
  */
 export function mockWindows(
   current: string,
   ...additionalWindows: string[]
 ): void {
-  window.__TAURI_METADATA__ = {
-    __windows: [current, ...additionalWindows].map((label) => ({ label })),
-    __currentWindow: { label: current }
+  mockInternals()
+  window.__TAURI_INTERNALS__.metadata = {
+    windows: [current, ...additionalWindows].map((label) => ({ label })),
+    currentWindow: { label: current },
+    webviews: [current, ...additionalWindows].map((label) => ({
+      windowLabel: label,
+      label
+    })),
+    currentWebview: { windowLabel: current, label: current }
+  }
+}
+
+/**
+ * Mock `convertFileSrc` function
+ *
+ *
+ * @example
+ * ```js
+ * import { mockConvertFileSrc } from "@tauri-apps/api/mocks";
+ * import { convertFileSrc } from "@tauri-apps/api/core";
+ *
+ * mockConvertFileSrc("windows")
+ *
+ * const url = convertFileSrc("C:\\Users\\user\\file.txt")
+ * ```
+ *
+ * @param osName The operating system to mock, can be one of linux, macos, or windows
+ *
+ * @since 1.6.0
+ */
+export function mockConvertFileSrc(osName: string): void {
+  mockInternals()
+  window.__TAURI_INTERNALS__.convertFileSrc = function (
+    filePath,
+    protocol = 'asset'
+  ) {
+    const path = encodeURIComponent(filePath)
+    return osName === 'windows'
+      ? `http://${protocol}.localhost/${path}`
+      : `${protocol}://localhost/${path}`
   }
 }
 
@@ -131,17 +203,28 @@ export function mockWindows(
  * test("mocked windows", () => {
  *    mockWindows("main", "second", "third");
  *
- *    expect(window).toHaveProperty("__TAURI_METADATA__")
+ *    expect(window.__TAURI_INTERNALS__).toHaveProperty("metadata")
  * })
  *
  * test("no mocked windows", () => {
- *    expect(window).not.toHaveProperty("__TAURI_METADATA__")
+ *    expect(window.__TAURI_INTERNALS__).not.toHaveProperty("metadata")
  * })
  * ```
+ *
+ * @since 1.0.0
  */
 export function clearMocks(): void {
-  // @ts-expect-error
-  delete window.__TAURI_IPC__
-  // @ts-expect-error
-  delete window.__TAURI_METADATA__
+  if (typeof window.__TAURI_INTERNALS__ !== 'object') {
+    return
+  }
+
+  if (window.__TAURI_INTERNALS__?.convertFileSrc)
+    // @ts-expect-error "The operand of a 'delete' operator must be optional' does not matter in this case
+    delete window.__TAURI_INTERNALS__.convertFileSrc
+  if (window.__TAURI_INTERNALS__?.invoke)
+    // @ts-expect-error "The operand of a 'delete' operator must be optional' does not matter in this case
+    delete window.__TAURI_INTERNALS__.invoke
+  if (window.__TAURI_INTERNALS__?.metadata)
+    // @ts-expect-error "The operand of a 'delete' operator must be optional' does not matter in this case
+    delete window.__TAURI_INTERNALS__.metadata
 }

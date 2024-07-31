@@ -1,12 +1,16 @@
+// Copyright 2019-2024 Tauri Programme within The Commons Conservancy
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
+
 const fixtureSetup = require('../fixtures/app-test-setup.js')
 const { resolve } = require('path')
-const { existsSync, readFileSync, writeFileSync } = require('fs')
+const { existsSync, readFileSync, writeFileSync, rmSync } = require('fs')
 const { move } = require('fs-extra')
 const cli = require('~/main.js')
 
 const currentDirName = __dirname
 
-describe('[CLI] cli.js template', () => {
+describe('[CLI] @tauri-apps/cli template', () => {
   it('init a project and builds it', async () => {
     const cwd = process.cwd()
     const fixturePath = resolve(currentDirName, '../fixtures/empty')
@@ -20,14 +24,13 @@ describe('[CLI] cli.js template', () => {
 
     const outExists = existsSync(outPath)
     if (outExists) {
+      if (existsSync(cacheOutPath)) {
+        rmSync(cacheOutPath, { recursive: true, force: true })
+      }
       await move(outPath, cacheOutPath)
     }
 
     await cli.run(['init', '--directory', process.cwd(), '--force', '--tauri-path', resolve(currentDirName, '../../../../../..'), '--ci'])
-      .catch(err => {
-        console.error(err)
-        throw err
-      })
 
     if (outExists) {
       await move(cacheOutPath, outPath)
@@ -43,10 +46,7 @@ describe('[CLI] cli.js template', () => {
     const config = readFileSync(configPath).toString()
     writeFileSync(configPath, config.replace('com.tauri.dev', 'com.tauri.test'))
 
-    await cli.run(['build', '--verbose']).catch(err => {
-      console.error(err)
-      throw err
-    })
+    await cli.run(['build', '--verbose'])
     process.chdir(cwd)
   })
 })

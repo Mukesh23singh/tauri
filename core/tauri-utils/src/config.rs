@@ -1,4 +1,4 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2019-2024 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
@@ -10,8 +10,6 @@
 //! This is a core functionality that is not considered part of the stable API.
 //! If you use it, note that it may include breaking changes in the future.
 
-#[cfg(target_os = "linux")]
-use heck::ToKebabCase;
 #[cfg(feature = "schema")]
 use schemars::JsonSchema;
 use semver::Version;
@@ -20,6 +18,7 @@ use serde::{
   Deserialize, Serialize, Serializer,
 };
 use serde_json::Value as JsonValue;
+use serde_untagged::UntaggedEnumVisitor;
 use serde_with::skip_serializing_none;
 use url::Url;
 
@@ -34,32 +33,65 @@ use std::{
 /// Items to help with parsing content into a [`Config`].
 pub mod parse;
 
+use crate::{acl::capability::Capability, TitleBarStyle, WindowEffect, WindowEffectState};
+
 pub use self::parse::parse;
 
+fn default_true() -> bool {
+  true
+}
+
 /// An URL to open on a Tauri webview window.
-#[derive(PartialEq, Eq, Debug, Clone, Deserialize, Serialize)]
+#[derive(PartialEq, Eq, Debug, Clone, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(untagged)]
 #[non_exhaustive]
-pub enum WindowUrl {
-  /// An external URL.
+pub enum WebviewUrl {
+  /// An external URL. Must use either the `http` or `https` schemes.
   External(Url),
   /// The path portion of an app URL.
   /// For instance, to load `tauri://localhost/users/john`,
   /// you can simply provide `users/john` in this configuration.
   App(PathBuf),
+  /// A custom protocol url, for example, `doom://index.html`
+  CustomProtocol(Url),
 }
 
-impl fmt::Display for WindowUrl {
+impl<'de> Deserialize<'de> for WebviewUrl {
+  fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum WebviewUrlDeserializer {
+      Url(Url),
+      Path(PathBuf),
+    }
+
+    match WebviewUrlDeserializer::deserialize(deserializer)? {
+      WebviewUrlDeserializer::Url(u) => {
+        if u.scheme() == "https" || u.scheme() == "http" {
+          Ok(Self::External(u))
+        } else {
+          Ok(Self::CustomProtocol(u))
+        }
+      }
+      WebviewUrlDeserializer::Path(p) => Ok(Self::App(p)),
+    }
+  }
+}
+
+impl fmt::Display for WebviewUrl {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      Self::External(url) => write!(f, "{}", url),
+      Self::External(url) | Self::CustomProtocol(url) => write!(f, "{url}"),
       Self::App(path) => write!(f, "{}", path.display()),
     }
   }
 }
 
-impl Default for WindowUrl {
+impl Default for WebviewUrl {
   fn default() -> Self {
     Self::App("index.html".into())
   }
@@ -72,16 +104,33 @@ impl Default for WindowUrl {
 pub enum BundleType {
   /// The debian bundle (.deb).
   Deb,
+  /// The RPM bundle (.rpm).
+  Rpm,
   /// The AppImage bundle (.appimage).
   AppImage,
   /// The Microsoft Installer bundle (.msi).
   Msi,
+  /// The NSIS bundle (.exe).
+  Nsis,
   /// The macOS application bundle (.app).
   App,
   /// The Apple Disk Image bundle (.dmg).
   Dmg,
-  /// The Tauri updater bundle.
-  Updater,
+}
+
+impl BundleType {
+  /// All bundle types.
+  fn all() -> &'static [Self] {
+    &[
+      BundleType::Deb,
+      BundleType::Rpm,
+      BundleType::AppImage,
+      BundleType::Msi,
+      BundleType::Nsis,
+      BundleType::App,
+      BundleType::Dmg,
+    ]
+  }
 }
 
 impl Display for BundleType {
@@ -91,11 +140,12 @@ impl Display for BundleType {
       "{}",
       match self {
         Self::Deb => "deb",
+        Self::Rpm => "rpm",
         Self::AppImage => "appimage",
         Self::Msi => "msi",
+        Self::Nsis => "nsis",
         Self::App => "app",
         Self::Dmg => "dmg",
-        Self::Updater => "updater",
       }
     )
   }
@@ -118,12 +168,13 @@ impl<'de> Deserialize<'de> for BundleType {
     let s = String::deserialize(deserializer)?;
     match s.to_lowercase().as_str() {
       "deb" => Ok(Self::Deb),
+      "rpm" => Ok(Self::Rpm),
       "appimage" => Ok(Self::AppImage),
       "msi" => Ok(Self::Msi),
+      "nsis" => Ok(Self::Nsis),
       "app" => Ok(Self::App),
       "dmg" => Ok(Self::Dmg),
-      "updater" => Ok(Self::Updater),
-      _ => Err(DeError::custom(format!("unknown bundle target '{}'", s))),
+      _ => Err(DeError::custom(format!("unknown bundle target '{s}'"))),
     }
   }
 }
@@ -156,19 +207,13 @@ impl schemars::JsonSchema for BundleTarget {
         ..Default::default()
       }
       .into(),
-      schemars::_private::apply_metadata(
+      schemars::_private::metadata::add_description(
         gen.subschema_for::<Vec<BundleType>>(),
-        schemars::schema::Metadata {
-          description: Some("A list of bundle targets.".to_owned()),
-          ..Default::default()
-        },
+        "A list of bundle targets.",
       ),
-      schemars::_private::apply_metadata(
+      schemars::_private::metadata::add_description(
         gen.subschema_for::<BundleType>(),
-        schemars::schema::Metadata {
-          description: Some("A single bundle target.".to_owned()),
-          ..Default::default()
-        },
+        "A single bundle target.",
       ),
     ];
 
@@ -221,7 +266,14 @@ impl<'de> Deserialize<'de> for BundleTarget {
 
     match BundleTargetInner::deserialize(deserializer)? {
       BundleTargetInner::All(s) if s.to_lowercase() == "all" => Ok(Self::All),
-      BundleTargetInner::All(t) => Err(DeError::custom(format!("invalid bundle type {}", t))),
+      BundleTargetInner::All(t) => Err(DeError::custom(format!(
+        "invalid bundle type {t}, expected one of `all`, {}",
+        BundleType::all()
+          .iter()
+          .map(|b| format!("`{b}`"))
+          .collect::<Vec<_>>()
+          .join(", ")
+      ))),
       BundleTargetInner::List(l) => Ok(Self::List(l)),
       BundleTargetInner::One(t) => Ok(Self::One(t)),
     }
@@ -233,7 +285,7 @@ impl BundleTarget {
   #[allow(dead_code)]
   pub fn to_vec(&self) -> Vec<BundleType> {
     match self {
-      Self::All => vec![],
+      Self::All => BundleType::all().to_vec(),
       Self::List(list) => list.clone(),
       Self::One(i) => vec![i.clone()],
     }
@@ -241,17 +293,24 @@ impl BundleTarget {
 }
 
 /// Configuration for AppImage bundles.
+///
+/// See more: <https://tauri.app/v1/api/config#appimageconfig>
 #[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AppImageConfig {
   /// Include additional gstreamer dependencies needed for audio and video playback.
   /// This increases the bundle size by ~15-35MB depending on your build system.
-  #[serde(default)]
+  #[serde(default, alias = "bundle-media-framework")]
   pub bundle_media_framework: bool,
+  /// The files to include in the Appimage Binary.
+  #[serde(default)]
+  pub files: HashMap<PathBuf, PathBuf>,
 }
 
 /// Configuration for Debian (.deb) bundles.
+///
+/// See more: <https://tauri.app/v1/api/config#debconfig>
 #[skip_serializing_none]
 #[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
@@ -259,9 +318,209 @@ pub struct AppImageConfig {
 pub struct DebConfig {
   /// The list of deb dependencies your application relies on.
   pub depends: Option<Vec<String>>,
+  /// The list of dependencies the package provides.
+  pub provides: Option<Vec<String>>,
+  /// The list of package conflicts.
+  pub conflicts: Option<Vec<String>>,
+  /// The list of package replaces.
+  pub replaces: Option<Vec<String>>,
   /// The files to include on the package.
   #[serde(default)]
   pub files: HashMap<PathBuf, PathBuf>,
+  /// Define the section in Debian Control file. See : https://www.debian.org/doc/debian-policy/ch-archive.html#s-subsections
+  pub section: Option<String>,
+  /// Change the priority of the Debian Package. By default, it is set to `optional`.
+  /// Recognized Priorities as of now are :  `required`, `important`, `standard`, `optional`, `extra`
+  pub priority: Option<String>,
+  /// Path of the uncompressed Changelog file, to be stored at /usr/share/doc/package-name/changelog.gz. See
+  /// <https://www.debian.org/doc/debian-policy/ch-docs.html#changelog-files-and-release-notes>
+  pub changelog: Option<PathBuf>,
+  /// Path to a custom desktop file Handlebars template.
+  ///
+  /// Available variables: `categories`, `comment` (optional), `exec`, `icon` and `name`.
+  #[serde(alias = "desktop-template")]
+  pub desktop_template: Option<PathBuf>,
+  /// Path to script that will be executed before the package is unpacked. See
+  /// <https://www.debian.org/doc/debian-policy/ch-maintainerscripts.html>
+  #[serde(alias = "pre-install-script")]
+  pub pre_install_script: Option<PathBuf>,
+  /// Path to script that will be executed after the package is unpacked. See
+  /// <https://www.debian.org/doc/debian-policy/ch-maintainerscripts.html>
+  #[serde(alias = "post-install-script")]
+  pub post_install_script: Option<PathBuf>,
+  /// Path to script that will be executed before the package is removed. See
+  /// <https://www.debian.org/doc/debian-policy/ch-maintainerscripts.html>
+  #[serde(alias = "pre-remove-script")]
+  pub pre_remove_script: Option<PathBuf>,
+  /// Path to script that will be executed after the package is removed. See
+  /// <https://www.debian.org/doc/debian-policy/ch-maintainerscripts.html>
+  #[serde(alias = "post-remove-script")]
+  pub post_remove_script: Option<PathBuf>,
+}
+
+/// Configuration for Linux bundles.
+///
+/// See more: <https://tauri.app/v1/api/config#linuxconfig>
+#[skip_serializing_none]
+#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LinuxConfig {
+  /// Configuration for the AppImage bundle.
+  #[serde(default)]
+  pub appimage: AppImageConfig,
+  /// Configuration for the Debian bundle.
+  #[serde(default)]
+  pub deb: DebConfig,
+  /// Configuration for the RPM bundle.
+  #[serde(default)]
+  pub rpm: RpmConfig,
+}
+
+/// Configuration for RPM bundles.
+#[skip_serializing_none]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RpmConfig {
+  /// The list of RPM dependencies your application relies on.
+  pub depends: Option<Vec<String>>,
+  /// The list of RPM dependencies your application provides.
+  pub provides: Option<Vec<String>>,
+  /// The list of RPM dependencies your application conflicts with. They must not be present
+  /// in order for the package to be installed.
+  pub conflicts: Option<Vec<String>>,
+  /// The list of RPM dependencies your application supersedes - if this package is installed,
+  /// packages listed as “obsoletes” will be automatically removed (if they are present).
+  pub obsoletes: Option<Vec<String>>,
+  /// The RPM release tag.
+  #[serde(default = "default_release")]
+  pub release: String,
+  /// The RPM epoch.
+  #[serde(default)]
+  pub epoch: u32,
+  /// The files to include on the package.
+  #[serde(default)]
+  pub files: HashMap<PathBuf, PathBuf>,
+  /// Path to a custom desktop file Handlebars template.
+  ///
+  /// Available variables: `categories`, `comment` (optional), `exec`, `icon` and `name`.
+  #[serde(alias = "desktop-template")]
+  pub desktop_template: Option<PathBuf>,
+  /// Path to script that will be executed before the package is unpacked. See
+  /// <http://ftp.rpm.org/max-rpm/s1-rpm-inside-scripts.html>
+  #[serde(alias = "pre-install-script")]
+  pub pre_install_script: Option<PathBuf>,
+  /// Path to script that will be executed after the package is unpacked. See
+  /// <http://ftp.rpm.org/max-rpm/s1-rpm-inside-scripts.html>
+  #[serde(alias = "post-install-script")]
+  pub post_install_script: Option<PathBuf>,
+  /// Path to script that will be executed before the package is removed. See
+  /// <http://ftp.rpm.org/max-rpm/s1-rpm-inside-scripts.html>
+  #[serde(alias = "pre-remove-script")]
+  pub pre_remove_script: Option<PathBuf>,
+  /// Path to script that will be executed after the package is removed. See
+  /// <http://ftp.rpm.org/max-rpm/s1-rpm-inside-scripts.html>
+  #[serde(alias = "post-remove-script")]
+  pub post_remove_script: Option<PathBuf>,
+}
+
+impl Default for RpmConfig {
+  fn default() -> Self {
+    Self {
+      depends: None,
+      provides: None,
+      conflicts: None,
+      obsoletes: None,
+      release: default_release(),
+      epoch: 0,
+      files: Default::default(),
+      desktop_template: None,
+      pre_install_script: None,
+      post_install_script: None,
+      pre_remove_script: None,
+      post_remove_script: None,
+    }
+  }
+}
+
+fn default_release() -> String {
+  "1".into()
+}
+
+/// Position coordinates struct.
+#[derive(Default, Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Position {
+  /// X coordinate.
+  pub x: u32,
+  /// Y coordinate.
+  pub y: u32,
+}
+
+/// Size of the window.
+#[derive(Default, Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Size {
+  /// Width of the window.
+  pub width: u32,
+  /// Height of the window.
+  pub height: u32,
+}
+
+/// Configuration for Apple Disk Image (.dmg) bundles.
+///
+/// See more: <https://tauri.app/v1/api/config#dmgconfig>
+#[skip_serializing_none]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DmgConfig {
+  /// Image to use as the background in dmg file. Accepted formats: `png`/`jpg`/`gif`.
+  pub background: Option<PathBuf>,
+  /// Position of volume window on screen.
+  pub window_position: Option<Position>,
+  /// Size of volume window.
+  #[serde(default = "dmg_window_size", alias = "window-size")]
+  pub window_size: Size,
+  /// Position of app file on window.
+  #[serde(default = "dmg_app_position", alias = "app-position")]
+  pub app_position: Position,
+  /// Position of application folder on window.
+  #[serde(
+    default = "dmg_application_folder_position",
+    alias = "application-folder-position"
+  )]
+  pub application_folder_position: Position,
+}
+
+impl Default for DmgConfig {
+  fn default() -> Self {
+    Self {
+      background: None,
+      window_position: None,
+      window_size: dmg_window_size(),
+      app_position: dmg_app_position(),
+      application_folder_position: dmg_application_folder_position(),
+    }
+  }
+}
+
+fn dmg_window_size() -> Size {
+  Size {
+    width: 660,
+    height: 400,
+  }
+}
+
+fn dmg_app_position() -> Position {
+  Position { x: 180, y: 170 }
+}
+
+fn dmg_application_folder_position() -> Position {
+  Position { x: 480, y: 170 }
 }
 
 fn de_minimum_system_version<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -276,6 +535,8 @@ where
 }
 
 /// Configuration for the macOS bundles.
+///
+/// See more: <https://tauri.app/v1/api/config#macconfig>
 #[skip_serializing_none]
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
@@ -285,6 +546,9 @@ pub struct MacConfig {
   ///
   /// If a name is used, ".framework" must be omitted and it will look for standard install locations. You may also use a path to a specific framework.
   pub frameworks: Option<Vec<String>>,
+  /// The files to include in the application relative to the Contents directory.
+  #[serde(default)]
+  pub files: HashMap<PathBuf, PathBuf>,
   /// A version string indicating the minimum macOS X version that the bundled application supports. Defaults to `10.13`.
   ///
   /// Setting it to `null` completely removes the `LSMinimumSystemVersion` field on the bundle's `Info.plist`
@@ -293,32 +557,44 @@ pub struct MacConfig {
   /// An empty string is considered an invalid value so the default value is used.
   #[serde(
     deserialize_with = "de_minimum_system_version",
-    default = "minimum_system_version"
+    default = "minimum_system_version",
+    alias = "minimum-system-version"
   )]
   pub minimum_system_version: Option<String>,
   /// Allows your application to communicate with the outside world.
   /// It should be a lowercase, without port and protocol domain name.
+  #[serde(alias = "exception-domain")]
   pub exception_domain: Option<String>,
-  /// The path to the license file to add to the DMG bundle.
-  pub license: Option<String>,
   /// Identity to use for code signing.
+  #[serde(alias = "signing-identity")]
   pub signing_identity: Option<String>,
+  /// Whether the codesign should enable [hardened runtime] (for executables) or not.
+  ///
+  /// [hardened runtime]: <https://developer.apple.com/documentation/security/hardened_runtime>
+  #[serde(alias = "hardened-runtime", default = "default_true")]
+  pub hardened_runtime: bool,
   /// Provider short name for notarization.
+  #[serde(alias = "provider-short-name")]
   pub provider_short_name: Option<String>,
   /// Path to the entitlements file.
   pub entitlements: Option<String>,
+  /// DMG-specific settings.
+  #[serde(default)]
+  pub dmg: DmgConfig,
 }
 
 impl Default for MacConfig {
   fn default() -> Self {
     Self {
       frameworks: None,
+      files: HashMap::new(),
       minimum_system_version: minimum_system_version(),
       exception_domain: None,
-      license: None,
       signing_identity: None,
+      hardened_runtime: true,
       provider_short_name: None,
       entitlements: None,
+      dmg: Default::default(),
     }
   }
 }
@@ -328,11 +604,14 @@ fn minimum_system_version() -> Option<String> {
 }
 
 /// Configuration for a target language for the WiX build.
+///
+/// See more: <https://tauri.app/v1/api/config#wixlanguageconfig>
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WixLanguageConfig {
   /// The path to a locale (`.wxl`) file. See <https://wixtoolset.org/documentation/manual/v3/howtos/ui_and_localization/build_a_localized_version.html>.
+  #[serde(alias = "locale-path")]
   pub locale_path: Option<String>,
 }
 
@@ -356,6 +635,8 @@ impl Default for WixLanguage {
 }
 
 /// Configuration for the MSI bundle using WiX.
+///
+/// See more: <https://tauri.app/v1/api/config#wixconfig>
 #[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -366,75 +647,290 @@ pub struct WixConfig {
   /// A custom .wxs template to use.
   pub template: Option<PathBuf>,
   /// A list of paths to .wxs files with WiX fragments to use.
-  #[serde(default)]
+  #[serde(default, alias = "fragment-paths")]
   pub fragment_paths: Vec<PathBuf>,
   /// The ComponentGroup element ids you want to reference from the fragments.
-  #[serde(default)]
+  #[serde(default, alias = "component-group-refs")]
   pub component_group_refs: Vec<String>,
   /// The Component element ids you want to reference from the fragments.
-  #[serde(default)]
+  #[serde(default, alias = "component-refs")]
   pub component_refs: Vec<String>,
   /// The FeatureGroup element ids you want to reference from the fragments.
-  #[serde(default)]
+  #[serde(default, alias = "feature-group-refs")]
   pub feature_group_refs: Vec<String>,
   /// The Feature element ids you want to reference from the fragments.
-  #[serde(default)]
+  #[serde(default, alias = "feature-refs")]
   pub feature_refs: Vec<String>,
   /// The Merge element ids you want to reference from the fragments.
-  #[serde(default)]
+  #[serde(default, alias = "merge-refs")]
   pub merge_refs: Vec<String>,
-  /// Disables the Webview2 runtime installation after app install.
-  #[serde(default)]
-  pub skip_webview_install: bool,
-  /// The path to the license file to render on the installer.
-  ///
-  /// Must be an RTF file, so if a different extension is provided, we convert it to the RTF format.
-  pub license: Option<PathBuf>,
   /// Create an elevated update task within Windows Task Scheduler.
-  #[serde(default)]
+  #[serde(default, alias = "enable-elevated-update-task")]
   pub enable_elevated_update_task: bool,
   /// Path to a bitmap file to use as the installation user interface banner.
   /// This bitmap will appear at the top of all but the first page of the installer.
   ///
   /// The required dimensions are 493px × 58px.
+  #[serde(alias = "banner-path")]
   pub banner_path: Option<PathBuf>,
   /// Path to a bitmap file to use on the installation user interface dialogs.
   /// It is used on the welcome and completion dialogs.
 
   /// The required dimensions are 493px × 312px.
+  #[serde(alias = "dialog-image-path")]
   pub dialog_image_path: Option<PathBuf>,
 }
 
+/// Compression algorithms used in the NSIS installer.
+///
+/// See <https://nsis.sourceforge.io/Reference/SetCompressor>
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum NsisCompression {
+  /// ZLIB uses the deflate algorithm, it is a quick and simple method. With the default compression level it uses about 300 KB of memory.
+  Zlib,
+  /// BZIP2 usually gives better compression ratios than ZLIB, but it is a bit slower and uses more memory. With the default compression level it uses about 4 MB of memory.
+  Bzip2,
+  /// LZMA (default) is a new compression method that gives very good compression ratios. The decompression speed is high (10-20 MB/s on a 2 GHz CPU), the compression speed is lower. The memory size that will be used for decompression is the dictionary size plus a few KBs, the default is 8 MB.
+  Lzma,
+  /// Disable compression
+  None,
+}
+
+impl Default for NsisCompression {
+  fn default() -> Self {
+    Self::Lzma
+  }
+}
+
+/// Install Modes for the NSIS installer.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub enum NSISInstallerMode {
+  /// Default mode for the installer.
+  ///
+  /// Install the app by default in a directory that doesn't require Administrator access.
+  ///
+  /// Installer metadata will be saved under the `HKCU` registry path.
+  CurrentUser,
+  /// Install the app by default in the `Program Files` folder directory requires Administrator
+  /// access for the installation.
+  ///
+  /// Installer metadata will be saved under the `HKLM` registry path.
+  PerMachine,
+  /// Combines both modes and allows the user to choose at install time
+  /// whether to install for the current user or per machine. Note that this mode
+  /// will require Administrator access even if the user wants to install it for the current user only.
+  ///
+  /// Installer metadata will be saved under the `HKLM` or `HKCU` registry path based on the user's choice.
+  Both,
+}
+
+impl Default for NSISInstallerMode {
+  fn default() -> Self {
+    Self::CurrentUser
+  }
+}
+
+/// Configuration for the Installer bundle using NSIS.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NsisConfig {
+  /// A custom .nsi template to use.
+  pub template: Option<PathBuf>,
+  /// The path to a bitmap file to display on the header of installers pages.
+  ///
+  /// The recommended dimensions are 150px x 57px.
+  #[serde(alias = "header-image")]
+  pub header_image: Option<PathBuf>,
+  /// The path to a bitmap file for the Welcome page and the Finish page.
+  ///
+  /// The recommended dimensions are 164px x 314px.
+  #[serde(alias = "sidebar-image")]
+  pub sidebar_image: Option<PathBuf>,
+  /// The path to an icon file used as the installer icon.
+  #[serde(alias = "install-icon")]
+  pub installer_icon: Option<PathBuf>,
+  /// Whether the installation will be for all users or just the current user.
+  #[serde(default, alias = "install-mode")]
+  pub install_mode: NSISInstallerMode,
+  /// A list of installer languages.
+  /// By default the OS language is used. If the OS language is not in the list of languages, the first language will be used.
+  /// To allow the user to select the language, set `display_language_selector` to `true`.
+  ///
+  /// See <https://github.com/kichik/nsis/tree/9465c08046f00ccb6eda985abbdbf52c275c6c4d/Contrib/Language%20files> for the complete list of languages.
+  pub languages: Option<Vec<String>>,
+  /// A key-value pair where the key is the language and the
+  /// value is the path to a custom `.nsh` file that holds the translated text for tauri's custom messages.
+  ///
+  /// See <https://github.com/tauri-apps/tauri/blob/dev/tooling/bundler/src/bundle/windows/templates/nsis-languages/English.nsh> for an example `.nsh` file.
+  ///
+  /// **Note**: the key must be a valid NSIS language and it must be added to [`NsisConfig`] languages array,
+  pub custom_language_files: Option<HashMap<String, PathBuf>>,
+  /// Whether to display a language selector dialog before the installer and uninstaller windows are rendered or not.
+  /// By default the OS language is selected, with a fallback to the first language in the `languages` array.
+  #[serde(default, alias = "display-language-selector")]
+  pub display_language_selector: bool,
+  /// Set the compression algorithm used to compress files in the installer.
+  ///
+  /// See <https://nsis.sourceforge.io/Reference/SetCompressor>
+  #[serde(default)]
+  pub compression: NsisCompression,
+  /// Set the folder name for the start menu shortcut.
+  ///
+  /// Use this option if you have multiple apps and wish to group their shortcuts under one folder
+  /// or if you generally prefer to set your shortcut inside a folder.
+  ///
+  /// Examples:
+  /// - `AwesomePublisher`, shortcut will be placed in `%AppData%\Microsoft\Windows\Start Menu\Programs\AwesomePublisher\<your-app>.lnk`
+  /// - If unset, shortcut will be placed in `%AppData%\Microsoft\Windows\Start Menu\Programs\<your-app>.lnk`
+  #[serde(alias = "start-menu-folder")]
+  pub start_menu_folder: Option<String>,
+  /// A path to a `.nsh` file that contains special NSIS macros to be hooked into the
+  /// main installer.nsi script.
+  ///
+  /// Supported hooks are:
+  /// - `NSIS_HOOK_PREINSTALL`: This hook runs before copying files, setting registry key values and creating shortcuts.
+  /// - `NSIS_HOOK_POSTINSTALL`: This hook runs after the installer has finished copying all files, setting the registry keys and created shortcuts.
+  /// - `NSIS_HOOK_PREUNINSTALL`: This hook runs before removing any files, registry keys and shortcuts.
+  /// - `NSIS_HOOK_POSTUNINSTALL`: This hook runs after files, registry keys and shortcuts have been removed.
+  ///
+  ///
+  /// ### Example
+  ///
+  /// ```nsh
+  /// !macro NSIS_HOOK_PREINSTALL
+  ///   MessageBox MB_OK "PreInstall"
+  /// !macroend
+  ///
+  /// !macro NSIS_HOOK_POSTINSTALL
+  ///   MessageBox MB_OK "PostInstall"
+  /// !macroend
+  ///
+  /// !macro NSIS_HOOK_PREUNINSTALL
+  ///   MessageBox MB_OK "PreUnInstall"
+  /// !macroend
+  ///
+  /// !macro NSIS_HOOK_POSTUNINSTALL
+  ///   MessageBox MB_OK "PostUninstall"
+  /// !macroend
+  ///
+  /// ```
+  #[serde(alias = "installer-hooks")]
+  pub installer_hooks: Option<PathBuf>,
+}
+
+/// Install modes for the Webview2 runtime.
+/// Note that for the updater bundle [`Self::DownloadBootstrapper`] is used.
+///
+/// For more information see <https://tauri.app/v1/guides/building/windows>.
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub enum WebviewInstallMode {
+  /// Do not install the Webview2 as part of the Windows Installer.
+  Skip,
+  /// Download the bootstrapper and run it.
+  /// Requires an internet connection.
+  /// Results in a smaller installer size, but is not recommended on Windows 7.
+  DownloadBootstrapper {
+    /// Instructs the installer to run the bootstrapper in silent mode. Defaults to `true`.
+    #[serde(default = "default_true")]
+    silent: bool,
+  },
+  /// Embed the bootstrapper and run it.
+  /// Requires an internet connection.
+  /// Increases the installer size by around 1.8MB, but offers better support on Windows 7.
+  EmbedBootstrapper {
+    /// Instructs the installer to run the bootstrapper in silent mode. Defaults to `true`.
+    #[serde(default = "default_true")]
+    silent: bool,
+  },
+  /// Embed the offline installer and run it.
+  /// Does not require an internet connection.
+  /// Increases the installer size by around 127MB.
+  OfflineInstaller {
+    /// Instructs the installer to run the installer in silent mode. Defaults to `true`.
+    #[serde(default = "default_true")]
+    silent: bool,
+  },
+  /// Embed a fixed webview2 version and use it at runtime.
+  /// Increases the installer size by around 180MB.
+  FixedRuntime {
+    /// The path to the fixed runtime to use.
+    ///
+    /// The fixed version can be downloaded [on the official website](https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download-section).
+    /// The `.cab` file must be extracted to a folder and this folder path must be defined on this field.
+    path: PathBuf,
+  },
+}
+
+impl Default for WebviewInstallMode {
+  fn default() -> Self {
+    Self::DownloadBootstrapper { silent: true }
+  }
+}
+
 /// Windows bundler configuration.
+///
+/// See more: <https://tauri.app/v1/api/config#windowsconfig>
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WindowsConfig {
   /// Specifies the file digest algorithm to use for creating file signatures.
   /// Required for code signing. SHA-256 is recommended.
+  #[serde(alias = "digest-algorithm")]
   pub digest_algorithm: Option<String>,
   /// Specifies the SHA1 hash of the signing certificate.
+  #[serde(alias = "certificate-thumbprint")]
   pub certificate_thumbprint: Option<String>,
   /// Server to use during timestamping.
+  #[serde(alias = "timestamp-url")]
   pub timestamp_url: Option<String>,
   /// Whether to use Time-Stamp Protocol (TSP, a.k.a. RFC 3161) for the timestamp server. Your code signing provider may
   /// use a TSP timestamp server, like e.g. SSL.com does. If so, enable TSP by setting to true.
   #[serde(default)]
   pub tsp: bool,
-  /// Path to the webview fixed runtime to use.
+  /// The installation mode for the Webview2 runtime.
+  #[serde(default, alias = "webview-install-mode")]
+  pub webview_install_mode: WebviewInstallMode,
+  /// Path to the webview fixed runtime to use. Overwrites [`Self::webview_install_mode`] if set.
+  ///
+  /// Will be removed in v2, prefer the [`Self::webview_install_mode`] option.
   ///
   /// The fixed version can be downloaded [on the official website](https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download-section).
   /// The `.cab` file must be extracted to a folder and this folder path must be defined on this field.
+  #[serde(alias = "webview-fixed-runtime-path")]
   pub webview_fixed_runtime_path: Option<PathBuf>,
   /// Validates a second app installation, blocking the user from installing an older version if set to `false`.
   ///
   /// For instance, if `1.2.1` is installed, the user won't be able to install app version `1.2.0` or `1.1.5`.
   ///
   /// The default value of this flag is `true`.
-  #[serde(default = "default_allow_downgrades")]
+  #[serde(default = "default_true", alias = "allow-downgrades")]
   pub allow_downgrades: bool,
   /// Configuration for the MSI generated with WiX.
   pub wix: Option<WixConfig>,
+  /// Configuration for the installer generated with NSIS.
+  pub nsis: Option<NsisConfig>,
+  /// Specify a custom command to sign the binaries.
+  /// This command needs to have a `%1` in it which is just a placeholder for the binary path,
+  /// which we will detect and replace before calling the command.
+  ///
+  /// Example:
+  /// ```text
+  /// sign-cli --arg1 --arg2 %1
+  /// ```
+  ///
+  /// By Default we use `signtool.exe` which can be found only on Windows so
+  /// if you are on another platform and want to cross-compile and sign you will
+  /// need to use another tool like `osslsigncode`.
+  #[serde(alias = "sign-command")]
+  pub sign_command: Option<String>,
 }
 
 impl Default for WindowsConfig {
@@ -444,18 +940,157 @@ impl Default for WindowsConfig {
       certificate_thumbprint: None,
       timestamp_url: None,
       tsp: false,
+      webview_install_mode: Default::default(),
       webview_fixed_runtime_path: None,
-      allow_downgrades: default_allow_downgrades(),
+      allow_downgrades: true,
       wix: None,
+      nsis: None,
+      sign_command: None,
     }
   }
 }
 
-fn default_allow_downgrades() -> bool {
-  true
+/// macOS-only. Corresponds to CFBundleTypeRole
+#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub enum BundleTypeRole {
+  /// CFBundleTypeRole.Editor. Files can be read and edited.
+  #[default]
+  Editor,
+  /// CFBundleTypeRole.Viewer. Files can be read.
+  Viewer,
+  /// CFBundleTypeRole.Shell
+  Shell,
+  /// CFBundleTypeRole.QLGenerator
+  QLGenerator,
+  /// CFBundleTypeRole.None
+  None,
+}
+
+impl Display for BundleTypeRole {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Editor => write!(f, "Editor"),
+      Self::Viewer => write!(f, "Viewer"),
+      Self::Shell => write!(f, "Shell"),
+      Self::QLGenerator => write!(f, "QLGenerator"),
+      Self::None => write!(f, "None"),
+    }
+  }
+}
+
+/// An extension for a [`FileAssociation`].
+///
+/// A leading `.` is automatically stripped.
+#[derive(Debug, PartialEq, Eq, Clone, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct AssociationExt(pub String);
+
+impl fmt::Display for AssociationExt {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "{}", self.0)
+  }
+}
+
+impl<'d> serde::Deserialize<'d> for AssociationExt {
+  fn deserialize<D: Deserializer<'d>>(deserializer: D) -> Result<Self, D::Error> {
+    let ext = String::deserialize(deserializer)?;
+    if let Some(ext) = ext.strip_prefix('.') {
+      Ok(AssociationExt(ext.into()))
+    } else {
+      Ok(AssociationExt(ext))
+    }
+  }
+}
+
+/// File association
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FileAssociation {
+  /// File extensions to associate with this app. e.g. 'png'
+  pub ext: Vec<AssociationExt>,
+  /// The name. Maps to `CFBundleTypeName` on macOS. Default to `ext[0]`
+  pub name: Option<String>,
+  /// The association description. Windows-only. It is displayed on the `Type` column on Windows Explorer.
+  pub description: Option<String>,
+  /// The app's role with respect to the type. Maps to `CFBundleTypeRole` on macOS.
+  #[serde(default)]
+  pub role: BundleTypeRole,
+  /// The mime-type e.g. 'image/png' or 'text/plain'. Linux-only.
+  #[serde(alias = "mime-type")]
+  pub mime_type: Option<String>,
+}
+
+/// File association
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeepLinkProtocol {
+  /// URL schemes to associate with this app without `://`. For example `my-app`
+  pub schemes: Vec<String>,
+  /// The protocol name. **macOS-only** and maps to `CFBundleTypeName`. Defaults to `<bundle-id>.<schemes[0]>`
+  pub name: Option<String>,
+  /// The app's role for these schemes. **macOS-only** and maps to `CFBundleTypeRole`.
+  #[serde(default)]
+  pub role: BundleTypeRole,
+}
+
+/// Definition for bundle resources.
+/// Can be either a list of paths to include or a map of source to target paths.
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields, untagged)]
+pub enum BundleResources {
+  /// A list of paths to include.
+  List(Vec<String>),
+  /// A map of source to target paths.
+  Map(HashMap<String, String>),
+}
+
+impl BundleResources {
+  /// Adds a path to the resource collection.
+  pub fn push(&mut self, path: impl Into<String>) {
+    match self {
+      Self::List(l) => l.push(path.into()),
+      Self::Map(l) => {
+        let path = path.into();
+        l.insert(path.clone(), path);
+      }
+    }
+  }
+}
+
+/// Updater type
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields, untagged)]
+pub enum Updater {
+  /// Generates lagacy zipped v1 compatible updaters
+  String(V1Compatible),
+  /// Produce updaters and their signatures or not
+  // Can't use untagged on enum field here: https://github.com/GREsau/schemars/issues/222
+  Bool(bool),
+}
+
+impl Default for Updater {
+  fn default() -> Self {
+    Self::Bool(false)
+  }
+}
+
+/// Generates lagacy zipped v1 compatible updaters
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum V1Compatible {
+  /// Generates lagacy zipped v1 compatible updaters
+  V1Compatible,
 }
 
 /// Configuration for tauri-bundler.
+///
+/// See more: <https://tauri.app/v1/api/config#bundleconfig>
 #[skip_serializing_none]
 #[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
@@ -464,42 +1099,48 @@ pub struct BundleConfig {
   /// Whether Tauri should bundle your application or just output the executable.
   #[serde(default)]
   pub active: bool,
-  /// The bundle targets, currently supports ["deb", "appimage", "msi", "app", "dmg", "updater"] or "all".
+  /// The bundle targets, currently supports ["deb", "rpm", "appimage", "nsis", "msi", "app", "dmg"] or "all".
   #[serde(default)]
   pub targets: BundleTarget,
-  /// The application identifier in reverse domain name notation (e.g. `com.tauri.example`).
-  /// This string must be unique across applications since it is used in system configurations like
-  /// the bundle ID and path to the webview data directory.
-  /// This string must contain only alphanumeric characters (A–Z, a–z, and 0–9), hyphens (-),
-  /// and periods (.).
-  pub identifier: String,
+  #[serde(default)]
+  /// Produce updaters and their signatures or not
+  pub create_updater_artifacts: Updater,
+  /// The application's publisher. Defaults to the second element in the identifier string.
+  /// Currently maps to the Manufacturer property of the Windows Installer.
+  pub publisher: Option<String>,
+  /// A url to the home page of your application. If unset, will
+  /// fallback to `homepage` defined in `Cargo.toml`.
+  ///
+  /// Supported bundle targets: `deb`, `rpm`, `nsis` and `msi`.
+  pub homepage: Option<String>,
   /// The app's icons
   #[serde(default)]
   pub icon: Vec<String>,
   /// App resources to bundle.
   /// Each resource is a path to a file or directory.
   /// Glob patterns are supported.
-  pub resources: Option<Vec<String>>,
+  pub resources: Option<BundleResources>,
   /// A copyright string associated with your application.
   pub copyright: Option<String>,
+  /// The package's license identifier to be included in the appropriate bundles.
+  /// If not set, defaults to the license from the Cargo.toml file.
+  pub license: Option<String>,
+  /// The path to the license file to be included in the appropriate bundles.
+  #[serde(alias = "license-file")]
+  pub license_file: Option<PathBuf>,
   /// The application kind.
   ///
   /// Should be one of the following:
   /// Business, DeveloperTool, Education, Entertainment, Finance, Game, ActionGame, AdventureGame, ArcadeGame, BoardGame, CardGame, CasinoGame, DiceGame, EducationalGame, FamilyGame, KidsGame, MusicGame, PuzzleGame, RacingGame, RolePlayingGame, SimulationGame, SportsGame, StrategyGame, TriviaGame, WordGame, GraphicsAndDesign, HealthcareAndFitness, Lifestyle, Medical, Music, News, Photography, Productivity, Reference, SocialNetworking, Sports, Travel, Utility, Video, Weather.
   pub category: Option<String>,
+  /// File associations to application.
+  pub file_associations: Option<Vec<FileAssociation>>,
   /// A short description of your application.
+  #[serde(alias = "short-description")]
   pub short_description: Option<String>,
   /// A longer, multi-line description of the application.
+  #[serde(alias = "long-description")]
   pub long_description: Option<String>,
-  /// Configuration for the AppImage bundle.
-  #[serde(default)]
-  pub appimage: AppImageConfig,
-  /// Configuration for the Debian bundle.
-  #[serde(default)]
-  pub deb: DebConfig,
-  /// Configuration for the macOS bundles.
-  #[serde(rename = "macOS", default)]
-  pub macos: MacConfig,
   /// A list of—either absolute or relative—paths to binaries to embed with your application.
   ///
   /// Note that Tauri will look for system-specific binaries following the pattern "binary-name{-target-triple}{.system-extension}".
@@ -511,179 +1152,58 @@ pub struct BundleConfig {
   /// - "my-binary-x86_64-unknown-linux-gnu" for Linux
   ///
   /// so don't forget to provide binaries for all targeted platforms.
+  #[serde(alias = "external-bin")]
   pub external_bin: Option<Vec<String>>,
-  /// Configuration for the Windows bundle.
+  /// Configuration for the Windows bundles.
   #[serde(default)]
   pub windows: WindowsConfig,
+  /// Configuration for the Linux bundles.
+  #[serde(default)]
+  pub linux: LinuxConfig,
+  /// Configuration for the macOS bundles.
+  #[serde(rename = "macOS", alias = "macos", default)]
+  pub macos: MacConfig,
+  /// iOS configuration.
+  #[serde(rename = "iOS", alias = "ios", default)]
+  pub ios: IosConfig,
+  /// Android configuration.
+  #[serde(default)]
+  pub android: AndroidConfig,
 }
 
-/// A CLI argument definition.
-#[skip_serializing_none]
-#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+/// a tuple struct of RGBA colors. Each value has minimum of 0 and maximum of 255.
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize, Default)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CliArg {
-  /// The short version of the argument, without the preceding -.
-  ///
-  /// NOTE: Any leading `-` characters will be stripped, and only the first non-character will be used as the short version.
-  pub short: Option<char>,
-  /// The unique argument name
-  pub name: String,
-  /// The argument description which will be shown on the help information.
-  /// Typically, this is a short (one line) description of the arg.
-  pub description: Option<String>,
-  /// The argument long description which will be shown on the help information.
-  /// Typically this a more detailed (multi-line) message that describes the argument.
-  pub long_description: Option<String>,
-  /// Specifies that the argument takes a value at run time.
-  ///
-  /// NOTE: values for arguments may be specified in any of the following methods
-  /// - Using a space such as -o value or --option value
-  /// - Using an equals and no space such as -o=value or --option=value
-  /// - Use a short and no space such as -ovalue
-  #[serde(default)]
-  pub takes_value: bool,
-  /// Specifies that the argument may have an unknown number of multiple values. Without any other settings, this argument may appear only once.
-  ///
-  /// For example, --opt val1 val2 is allowed, but --opt val1 val2 --opt val3 is not.
-  ///
-  /// NOTE: Setting this requires `takes_value` to be set to true.
-  #[serde(default)]
-  pub multiple: bool,
-  /// Specifies that the argument may appear more than once.
-  /// For flags, this results in the number of occurrences of the flag being recorded. For example -ddd or -d -d -d would count as three occurrences.
-  /// For options or arguments that take a value, this does not affect how many values they can accept. (i.e. only one at a time is allowed)
-  ///
-  /// For example, --opt val1 --opt val2 is allowed, but --opt val1 val2 is not.
-  #[serde(default)]
-  pub multiple_occurrences: bool,
-  /// Specifies how many values are required to satisfy this argument. For example, if you had a
-  /// `-f <file>` argument where you wanted exactly 3 'files' you would set
-  /// `number_of_values = 3`, and this argument wouldn't be satisfied unless the user provided
-  /// 3 and only 3 values.
-  ///
-  /// **NOTE:** Does *not* require `multiple_occurrences = true` to be set. Setting
-  /// `multiple_occurrences = true` would allow `-f <file> <file> <file> -f <file> <file> <file>` where
-  /// as *not* setting it would only allow one occurrence of this argument.
-  ///
-  /// **NOTE:** implicitly sets `takes_value = true` and `multiple_values = true`.
-  pub number_of_values: Option<usize>,
-  /// Specifies a list of possible values for this argument.
-  /// At runtime, the CLI verifies that only one of the specified values was used, or fails with an error message.
-  pub possible_values: Option<Vec<String>>,
-  /// Specifies the minimum number of values for this argument.
-  /// For example, if you had a -f `<file>` argument where you wanted at least 2 'files',
-  /// you would set `minValues: 2`, and this argument would be satisfied if the user provided, 2 or more values.
-  pub min_values: Option<usize>,
-  /// Specifies the maximum number of values are for this argument.
-  /// For example, if you had a -f `<file>` argument where you wanted up to 3 'files',
-  /// you would set .max_values(3), and this argument would be satisfied if the user provided, 1, 2, or 3 values.
-  pub max_values: Option<usize>,
-  /// Sets whether or not the argument is required by default.
-  ///
-  /// - Required by default means it is required, when no other conflicting rules have been evaluated
-  /// - Conflicting rules take precedence over being required.
-  #[serde(default)]
-  pub required: bool,
-  /// Sets an arg that override this arg's required setting
-  /// i.e. this arg will be required unless this other argument is present.
-  pub required_unless_present: Option<String>,
-  /// Sets args that override this arg's required setting
-  /// i.e. this arg will be required unless all these other arguments are present.
-  pub required_unless_present_all: Option<Vec<String>>,
-  /// Sets args that override this arg's required setting
-  /// i.e. this arg will be required unless at least one of these other arguments are present.
-  pub required_unless_present_any: Option<Vec<String>>,
-  /// Sets a conflicting argument by name
-  /// i.e. when using this argument, the following argument can't be present and vice versa.
-  pub conflicts_with: Option<String>,
-  /// The same as conflictsWith but allows specifying multiple two-way conflicts per argument.
-  pub conflicts_with_all: Option<Vec<String>>,
-  /// Tets an argument by name that is required when this one is present
-  /// i.e. when using this argument, the following argument must be present.
-  pub requires: Option<String>,
-  /// Sts multiple arguments by names that are required when this one is present
-  /// i.e. when using this argument, the following arguments must be present.
-  pub requires_all: Option<Vec<String>>,
-  /// Allows a conditional requirement with the signature [arg, value]
-  /// the requirement will only become valid if `arg`'s value equals `${value}`.
-  pub requires_if: Option<Vec<String>>,
-  /// Allows specifying that an argument is required conditionally with the signature [arg, value]
-  /// the requirement will only become valid if the `arg`'s value equals `${value}`.
-  pub required_if_eq: Option<Vec<String>>,
-  /// Requires that options use the --option=val syntax
-  /// i.e. an equals between the option and associated value.
-  pub require_equals: Option<bool>,
-  /// The positional argument index, starting at 1.
-  ///
-  /// The index refers to position according to other positional argument.
-  /// It does not define position in the argument list as a whole. When utilized with multiple=true,
-  /// only the last positional argument may be defined as multiple (i.e. the one with the highest index).
-  #[cfg_attr(feature = "schema", validate(range(min = 1)))]
-  pub index: Option<usize>,
+pub struct Color(pub u8, pub u8, pub u8, pub u8);
+
+impl From<Color> for (u8, u8, u8, u8) {
+  fn from(value: Color) -> Self {
+    (value.0, value.1, value.2, value.3)
+  }
 }
 
-/// describes a CLI configuration
+/// The window effects configuration object
 #[skip_serializing_none]
-#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Clone, Deserialize, Serialize, Default)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CliConfig {
-  /// Command description which will be shown on the help information.
-  pub description: Option<String>,
-  /// Command long description which will be shown on the help information.
-  pub long_description: Option<String>,
-  /// Adds additional help information to be displayed in addition to auto-generated help.
-  /// This information is displayed before the auto-generated help information.
-  /// This is often used for header information.
-  pub before_help: Option<String>,
-  /// Adds additional help information to be displayed in addition to auto-generated help.
-  /// This information is displayed after the auto-generated help information.
-  /// This is often used to describe how to use the arguments, or caveats to be noted.
-  pub after_help: Option<String>,
-  /// List of arguments for the command
-  pub args: Option<Vec<CliArg>>,
-  /// List of subcommands of this command
-  pub subcommands: Option<HashMap<String, CliConfig>>,
-}
-
-impl CliConfig {
-  /// List of arguments for the command
-  pub fn args(&self) -> Option<&Vec<CliArg>> {
-    self.args.as_ref()
-  }
-
-  /// List of subcommands of this command
-  pub fn subcommands(&self) -> Option<&HashMap<String, CliConfig>> {
-    self.subcommands.as_ref()
-  }
-
-  /// Command description which will be shown on the help information.
-  pub fn description(&self) -> Option<&String> {
-    self.description.as_ref()
-  }
-
-  /// Command long description which will be shown on the help information.
-  pub fn long_description(&self) -> Option<&String> {
-    self.description.as_ref()
-  }
-
-  /// Adds additional help information to be displayed in addition to auto-generated help.
-  /// This information is displayed before the auto-generated help information.
-  /// This is often used for header information.
-  pub fn before_help(&self) -> Option<&String> {
-    self.before_help.as_ref()
-  }
-
-  /// Adds additional help information to be displayed in addition to auto-generated help.
-  /// This information is displayed after the auto-generated help information.
-  /// This is often used to describe how to use the arguments, or caveats to be noted.
-  pub fn after_help(&self) -> Option<&String> {
-    self.after_help.as_ref()
-  }
+pub struct WindowEffectsConfig {
+  /// List of Window effects to apply to the Window.
+  /// Conflicting effects will apply the first one and ignore the rest.
+  pub effects: Vec<WindowEffect>,
+  /// Window effect state **macOS Only**
+  pub state: Option<WindowEffectState>,
+  /// Window effect corner radius **macOS Only**
+  pub radius: Option<f64>,
+  /// Window effect color. Affects [`WindowEffect::Blur`] and [`WindowEffect::Acrylic`] only
+  /// on Windows 10 v1903+. Doesn't have any effect on Windows 7 or Windows 11.
+  pub color: Option<Color>,
 }
 
 /// The window configuration object.
+///
+/// See more: <https://tauri.app/v1/api/config#windowconfig>
 #[skip_serializing_none]
 #[derive(Debug, PartialEq, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
@@ -694,12 +1214,15 @@ pub struct WindowConfig {
   pub label: String,
   /// The window webview URL.
   #[serde(default)]
-  pub url: WindowUrl,
-  /// Whether the file drop is enabled or not on the webview. By default it is enabled.
+  pub url: WebviewUrl,
+  /// The user agent for the webview
+  #[serde(alias = "user-agent")]
+  pub user_agent: Option<String>,
+  /// Whether the drag and drop is enabled or not on the webview. By default it is enabled.
   ///
-  /// Disabling it is required to use drag and drop on the frontend on Windows.
-  #[serde(default = "default_file_drop_enabled")]
-  pub file_drop_enabled: bool,
+  /// Disabling it is required to use HTML5 drag and drop on the frontend on Windows.
+  #[serde(default = "default_true", alias = "drag-drop-enabled")]
+  pub drag_drop_enabled: bool,
   /// Whether or not the window starts centered or not.
   #[serde(default)]
   pub center: bool,
@@ -714,28 +1237,57 @@ pub struct WindowConfig {
   #[serde(default = "default_height")]
   pub height: f64,
   /// The min window width.
+  #[serde(alias = "min-width")]
   pub min_width: Option<f64>,
   /// The min window height.
+  #[serde(alias = "min-height")]
   pub min_height: Option<f64>,
   /// The max window width.
+  #[serde(alias = "max-width")]
   pub max_width: Option<f64>,
   /// The max window height.
+  #[serde(alias = "max-height")]
   pub max_height: Option<f64>,
-  /// Whether the window is resizable or not.
-  #[serde(default = "default_resizable")]
+  /// Whether the window is resizable or not. When resizable is set to false, native window's maximize button is automatically disabled.
+  #[serde(default = "default_true")]
   pub resizable: bool,
+  /// Whether the window's native maximize button is enabled or not.
+  /// If resizable is set to false, this setting is ignored.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **macOS:** Disables the "zoom" button in the window titlebar, which is also used to enter fullscreen mode.
+  /// - **Linux / iOS / Android:** Unsupported.
+  #[serde(default = "default_true")]
+  pub maximizable: bool,
+  /// Whether the window's native minimize button is enabled or not.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Linux / iOS / Android:** Unsupported.
+  #[serde(default = "default_true")]
+  pub minimizable: bool,
+  /// Whether the window's native close button is enabled or not.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Linux:** "GTK+ will do its best to convince the window manager not to show a close button.
+  ///   Depending on the system, this function may not have any effect when called on a window that is already visible"
+  /// - **iOS / Android:** Unsupported.
+  #[serde(default = "default_true")]
+  pub closable: bool,
   /// The window title.
   #[serde(default = "default_title")]
   pub title: String,
   /// Whether the window starts as fullscreen or not.
   #[serde(default)]
   pub fullscreen: bool,
-  /// Whether the window will be initially hidden or focused.
-  #[serde(default = "default_focus")]
+  /// Whether the window will be initially focused or not.
+  #[serde(default = "default_true")]
   pub focus: bool,
   /// Whether the window is transparent or not.
   ///
-  /// Note that on `macOS` this requires the `macos-private-api` feature flag, enabled under `tauri.conf.json > tauri > macOSPrivateApi`.
+  /// Note that on `macOS` this requires the `macos-private-api` feature flag, enabled under `tauri > macOSPrivateApi`.
   /// WARNING: Using private APIs on `macOS` prevents your application from being accepted to the `App Store`.
   #[serde(default)]
   pub transparent: bool,
@@ -743,27 +1295,121 @@ pub struct WindowConfig {
   #[serde(default)]
   pub maximized: bool,
   /// Whether the window is visible or not.
-  #[serde(default = "default_visible")]
+  #[serde(default = "default_true")]
   pub visible: bool,
   /// Whether the window should have borders and bars.
-  #[serde(default = "default_decorations")]
+  #[serde(default = "default_true")]
   pub decorations: bool,
+  /// Whether the window should always be below other windows.
+  #[serde(default, alias = "always-on-bottom")]
+  pub always_on_bottom: bool,
   /// Whether the window should always be on top of other windows.
-  #[serde(default)]
+  #[serde(default, alias = "always-on-top")]
   pub always_on_top: bool,
-  /// Whether or not the window icon should be added to the taskbar.
-  #[serde(default)]
+  /// Whether the window should be visible on all workspaces or virtual desktops.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Windows / iOS / Android:** Unsupported.
+  #[serde(default, alias = "visible-on-all-workspaces")]
+  pub visible_on_all_workspaces: bool,
+  /// Prevents the window contents from being captured by other apps.
+  #[serde(default, alias = "content-protected")]
+  pub content_protected: bool,
+  /// If `true`, hides the window icon from the taskbar on Windows and Linux.
+  #[serde(default, alias = "skip-taskbar")]
   pub skip_taskbar: bool,
   /// The initial window theme. Defaults to the system theme. Only implemented on Windows and macOS 10.14+.
   pub theme: Option<crate::Theme>,
+  /// The style of the macOS title bar.
+  #[serde(default, alias = "title-bar-style")]
+  pub title_bar_style: TitleBarStyle,
+  /// If `true`, sets the window title to be hidden on macOS.
+  #[serde(default, alias = "hidden-title")]
+  pub hidden_title: bool,
+  /// Whether clicking an inactive window also clicks through to the webview on macOS.
+  #[serde(default, alias = "accept-first-mouse")]
+  pub accept_first_mouse: bool,
+  /// Defines the window [tabbing identifier] for macOS.
+  ///
+  /// Windows with matching tabbing identifiers will be grouped together.
+  /// If the tabbing identifier is not set, automatic tabbing will be disabled.
+  ///
+  /// [tabbing identifier]: <https://developer.apple.com/documentation/appkit/nswindow/1644704-tabbingidentifier>
+  #[serde(default, alias = "tabbing-identifier")]
+  pub tabbing_identifier: Option<String>,
+  /// Defines additional browser arguments on Windows. By default wry passes `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`
+  /// so if you use this method, you also need to disable these components by yourself if you want.
+  #[serde(default, alias = "additional-browser-args")]
+  pub additional_browser_args: Option<String>,
+  /// Whether or not the window has shadow.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Windows:**
+  ///   - `false` has no effect on decorated window, shadow are always ON.
+  ///   - `true` will make ndecorated window have a 1px white border,
+  /// and on Windows 11, it will have a rounded corners.
+  /// - **Linux:** Unsupported.
+  #[serde(default = "default_true")]
+  pub shadow: bool,
+  /// Window effects.
+  ///
+  /// Requires the window to be transparent.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **Windows**: If using decorations or shadows, you may want to try this workaround <https://github.com/tauri-apps/tao/issues/72#issuecomment-975607891>
+  /// - **Linux**: Unsupported
+  #[serde(default, alias = "window-effects")]
+  pub window_effects: Option<WindowEffectsConfig>,
+  /// Whether or not the webview should be launched in incognito  mode.
+  ///
+  ///  ## Platform-specific:
+  ///
+  ///  - **Android**: Unsupported.
+  #[serde(default)]
+  pub incognito: bool,
+  /// Sets the window associated with this label to be the parent of the window to be created.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Windows**: This sets the passed parent as an owner window to the window to be created.
+  ///   From [MSDN owned windows docs](https://docs.microsoft.com/en-us/windows/win32/winmsg/window-features#owned-windows):
+  ///     - An owned window is always above its owner in the z-order.
+  ///     - The system automatically destroys an owned window when its owner is destroyed.
+  ///     - An owned window is hidden when its owner is minimized.
+  /// - **Linux**: This makes the new window transient for parent, see <https://docs.gtk.org/gtk3/method.Window.set_transient_for.html>
+  /// - **macOS**: This adds the window as a child of parent, see <https://developer.apple.com/documentation/appkit/nswindow/1419152-addchildwindow?language=objc>
+  pub parent: Option<String>,
+  /// The proxy URL for the WebView for all network requests.
+  ///
+  /// Must be either a `http://` or a `socks5://` URL.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **macOS**: Requires the `macos-proxy` feature flag and only compiles for macOS 14+.
+  pub proxy_url: Option<Url>,
+  /// Whether page zooming by hotkeys is enabled
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **Windows**: Controls WebView2's [`IsZoomControlEnabled`](https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/winrt/microsoft_web_webview2_core/corewebview2settings?view=webview2-winrt-1.0.2420.47#iszoomcontrolenabled) setting.
+  /// - **MacOS / Linux**: Injects a polyfill that zooms in and out with `ctrl/command` + `-/=`,
+  /// 20% in each step, ranging from 20% to 1000%. Requires `webview:allow-set-webview-zoom` permission
+  ///
+  /// - **Android / iOS**: Unsupported.
+  #[serde(default)]
+  pub zoom_hotkeys_enabled: bool,
 }
 
 impl Default for WindowConfig {
   fn default() -> Self {
     Self {
       label: default_window_label(),
-      url: WindowUrl::default(),
-      file_drop_enabled: default_file_drop_enabled(),
+      url: WebviewUrl::default(),
+      user_agent: None,
+      drag_drop_enabled: true,
       center: false,
       x: None,
       y: None,
@@ -773,17 +1419,34 @@ impl Default for WindowConfig {
       min_height: None,
       max_width: None,
       max_height: None,
-      resizable: default_resizable(),
+      resizable: true,
+      maximizable: true,
+      minimizable: true,
+      closable: true,
       title: default_title(),
       fullscreen: false,
       focus: false,
       transparent: false,
       maximized: false,
-      visible: default_visible(),
-      decorations: default_decorations(),
+      visible: true,
+      decorations: true,
+      always_on_bottom: false,
       always_on_top: false,
+      visible_on_all_workspaces: false,
+      content_protected: false,
       skip_taskbar: false,
       theme: None,
+      title_bar_style: Default::default(),
+      hidden_title: false,
+      accept_first_mouse: false,
+      tabbing_identifier: None,
+      additional_browser_args: None,
+      shadow: true,
+      window_effects: None,
+      incognito: false,
+      parent: None,
+      proxy_url: None,
+      zoom_hotkeys_enabled: false,
     }
   }
 }
@@ -800,28 +1463,8 @@ fn default_height() -> f64 {
   600f64
 }
 
-fn default_resizable() -> bool {
-  true
-}
-
 fn default_title() -> String {
   "Tauri App".to_string()
-}
-
-fn default_focus() -> bool {
-  true
-}
-
-fn default_visible() -> bool {
-  true
-}
-
-fn default_decorations() -> bool {
-  true
-}
-
-fn default_file_drop_enabled() -> bool {
-  true
 }
 
 /// A Content-Security-Policy directive source list.
@@ -855,7 +1498,7 @@ impl CspDirectiveSources {
   /// Whether the given source is configured on this directive or not.
   pub fn contains(&self, source: &str) -> bool {
     match self {
-      Self::Inline(s) => s.contains(&format!("{} ", source)) || s.contains(&format!(" {}", source)),
+      Self::Inline(s) => s.contains(&format!("{source} ")) || s.contains(&format!(" {source}")),
       Self::List(l) => l.contains(&source.into()),
     }
   }
@@ -921,7 +1564,7 @@ impl From<Csp> for HashMap<String, CspDirectiveSources> {
 impl Display for Csp {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      Self::Policy(s) => write!(f, "{}", s),
+      Self::Policy(s) => write!(f, "{s}"),
       Self::DirectiveMap(m) => {
         let len = m.len();
         let mut i = 0;
@@ -967,72 +1610,22 @@ impl Default for DisabledCspModificationKind {
   }
 }
 
-/// Security configuration.
-#[skip_serializing_none]
-#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SecurityConfig {
-  /// The Content Security Policy that will be injected on all HTML files on the built application.
-  /// If [`dev_csp`](#SecurityConfig.devCsp) is not specified, this value is also injected on dev.
-  ///
-  /// This is a really important part of the configuration since it helps you ensure your WebView is secured.
-  /// See <https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP>.
-  pub csp: Option<Csp>,
-  /// The Content Security Policy that will be injected on all HTML files on development.
-  ///
-  /// This is a really important part of the configuration since it helps you ensure your WebView is secured.
-  /// See <https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP>.
-  pub dev_csp: Option<Csp>,
-  /// Freeze the `Object.prototype` when using the custom protocol.
-  #[serde(default)]
-  pub freeze_prototype: bool,
-  /// Disables the Tauri-injected CSP sources.
-  ///
-  /// At compile time, Tauri parses all the frontend assets and changes the Content-Security-Policy
-  /// to only allow loading of your own scripts and styles by injecting nonce and hash sources.
-  /// This stricts your CSP, which may introduce issues when using along with other flexing sources.
-  ///
-  /// This configuration option allows both a boolean and a list of strings as value.
-  /// A boolean instructs Tauri to disable the injection for all CSP injections,
-  /// and a list of strings indicates the CSP directives that Tauri cannot inject.
-  ///
-  /// **WARNING:** Only disable this if you know what you are doing and have properly configured the CSP.
-  /// Your application might be vulnerable to XSS attacks without this Tauri protection.
-  #[serde(default)]
-  pub dangerous_disable_asset_csp_modification: DisabledCspModificationKind,
-}
-
-/// Defines an allowlist type.
-pub trait Allowlist {
-  /// Returns all features associated with the allowlist struct.
-  fn all_features() -> Vec<&'static str>;
-  /// Returns the tauri features enabled on this allowlist.
-  fn to_features(&self) -> Vec<&'static str>;
-}
-
-macro_rules! check_feature {
-  ($self:ident, $features:ident, $flag:ident, $feature_name: expr) => {
-    if $self.$flag {
-      $features.push($feature_name)
-    }
-  };
-}
-
-/// Filesystem scope definition.
+/// Protocol scope definition.
 /// It is a list of glob patterns that restrict the API access from the webview.
 ///
 /// Each pattern can start with a variable that resolves to a system base directory.
 /// The variables are: `$AUDIO`, `$CACHE`, `$CONFIG`, `$DATA`, `$LOCALDATA`, `$DESKTOP`,
 /// `$DOCUMENT`, `$DOWNLOAD`, `$EXE`, `$FONT`, `$HOME`, `$PICTURE`, `$PUBLIC`, `$RUNTIME`,
-/// `$TEMPLATE`, `$VIDEO`, `$RESOURCE`, `$APP`, `$LOG`, `$TEMP`.
+/// `$TEMPLATE`, `$VIDEO`, `$RESOURCE`, `$APP`, `$LOG`, `$TEMP`, `$APPCONFIG`, `$APPDATA`,
+/// `$APPLOCALDATA`, `$APPCACHE`, `$APPLOG`.
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(untagged)]
-pub enum FsAllowlistScope {
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub enum FsScope {
   /// A list of paths that are allowed by this scope.
   AllowedPaths(Vec<PathBuf>),
   /// A complete scope configuration.
+  #[serde(rename_all = "camelCase")]
   Scope {
     /// A list of paths that are allowed by this scope.
     #[serde(default)]
@@ -1041,16 +1634,26 @@ pub enum FsAllowlistScope {
     /// This gets precedence over the [`Self::Scope::allow`] list.
     #[serde(default)]
     deny: Vec<PathBuf>,
+    /// Whether or not paths that contain components that start with a `.`
+    /// will require that `.` appears literally in the pattern; `*`, `?`, `**`,
+    /// or `[...]` will not match. This is useful because such files are
+    /// conventionally considered hidden on Unix systems and it might be
+    /// desirable to skip them when listing files.
+    ///
+    /// Defaults to `true` on Unix systems and `false` on Windows
+    // dotfiles are not supposed to be exposed by default on unix
+    #[serde(alias = "require-literal-leading-dot")]
+    require_literal_leading_dot: Option<bool>,
   },
 }
 
-impl Default for FsAllowlistScope {
+impl Default for FsScope {
   fn default() -> Self {
     Self::AllowedPaths(Vec::new())
   }
 }
 
-impl FsAllowlistScope {
+impl FsScope {
   /// The list of allowed paths.
   pub fn allowed_paths(&self) -> &Vec<PathBuf> {
     match self {
@@ -1068,861 +1671,91 @@ impl FsAllowlistScope {
   }
 }
 
-/// Allowlist for the file system APIs.
+/// Config for the asset custom protocol.
+///
+/// See more: <https://tauri.app/v1/api/config#assetprotocolconfig>
 #[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct FsAllowlistConfig {
-  /// The access scope for the filesystem APIs.
+pub struct AssetProtocolConfig {
+  /// The access scope for the asset protocol.
   #[serde(default)]
-  pub scope: FsAllowlistScope,
-  /// Use this flag to enable all file system API features.
+  pub scope: FsScope,
+  /// Enables the asset protocol.
   #[serde(default)]
-  pub all: bool,
-  /// Read file from local filesystem.
-  #[serde(default)]
-  pub read_file: bool,
-  /// Write file to local filesystem.
-  #[serde(default)]
-  pub write_file: bool,
-  /// Read directory from local filesystem.
-  #[serde(default)]
-  pub read_dir: bool,
-  /// Copy file from local filesystem.
-  #[serde(default)]
-  pub copy_file: bool,
-  /// Create directory from local filesystem.
-  #[serde(default)]
-  pub create_dir: bool,
-  /// Remove directory from local filesystem.
-  #[serde(default)]
-  pub remove_dir: bool,
-  /// Remove file from local filesystem.
-  #[serde(default)]
-  pub remove_file: bool,
-  /// Rename file from local filesystem.
-  #[serde(default)]
-  pub rename_file: bool,
+  pub enable: bool,
 }
 
-impl Allowlist for FsAllowlistConfig {
-  fn all_features() -> Vec<&'static str> {
-    let allowlist = Self {
-      scope: Default::default(),
-      all: false,
-      read_file: true,
-      write_file: true,
-      read_dir: true,
-      copy_file: true,
-      create_dir: true,
-      remove_dir: true,
-      remove_file: true,
-      rename_file: true,
-    };
-    let mut features = allowlist.to_features();
-    features.push("fs-all");
-    features
-  }
-
-  fn to_features(&self) -> Vec<&'static str> {
-    if self.all {
-      vec!["fs-all"]
-    } else {
-      let mut features = Vec::new();
-      check_feature!(self, features, read_file, "fs-read-file");
-      check_feature!(self, features, write_file, "fs-write-file");
-      check_feature!(self, features, read_dir, "fs-read-dir");
-      check_feature!(self, features, copy_file, "fs-copy-file");
-      check_feature!(self, features, create_dir, "fs-create-dir");
-      check_feature!(self, features, remove_dir, "fs-remove-dir");
-      check_feature!(self, features, remove_file, "fs-remove-file");
-      check_feature!(self, features, rename_file, "fs-rename-file");
-      features
-    }
-  }
-}
-
-/// Allowlist for the window APIs.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
+/// Security configuration.
+///
+/// See more: <https://tauri.app/v1/api/config#securityconfig>
+#[skip_serializing_none]
+#[derive(Debug, Default, PartialEq, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WindowAllowlistConfig {
-  /// Use this flag to enable all window API features.
-  #[serde(default)]
-  pub all: bool,
-  /// Allows dynamic window creation.
-  #[serde(default)]
-  pub create: bool,
-  /// Allows centering the window.
-  #[serde(default)]
-  pub center: bool,
-  /// Allows requesting user attention on the window.
-  #[serde(default)]
-  pub request_user_attention: bool,
-  /// Allows setting the resizable flag of the window.
-  #[serde(default)]
-  pub set_resizable: bool,
-  /// Allows changing the window title.
-  #[serde(default)]
-  pub set_title: bool,
-  /// Allows maximizing the window.
-  #[serde(default)]
-  pub maximize: bool,
-  /// Allows unmaximizing the window.
-  #[serde(default)]
-  pub unmaximize: bool,
-  /// Allows minimizing the window.
-  #[serde(default)]
-  pub minimize: bool,
-  /// Allows unminimizing the window.
-  #[serde(default)]
-  pub unminimize: bool,
-  /// Allows showing the window.
-  #[serde(default)]
-  pub show: bool,
-  /// Allows hiding the window.
-  #[serde(default)]
-  pub hide: bool,
-  /// Allows closing the window.
-  #[serde(default)]
-  pub close: bool,
-  /// Allows setting the decorations flag of the window.
-  #[serde(default)]
-  pub set_decorations: bool,
-  /// Allows setting the always_on_top flag of the window.
-  #[serde(default)]
-  pub set_always_on_top: bool,
-  /// Allows setting the window size.
-  #[serde(default)]
-  pub set_size: bool,
-  /// Allows setting the window minimum size.
-  #[serde(default)]
-  pub set_min_size: bool,
-  /// Allows setting the window maximum size.
-  #[serde(default)]
-  pub set_max_size: bool,
-  /// Allows changing the position of the window.
-  #[serde(default)]
-  pub set_position: bool,
-  /// Allows setting the fullscreen flag of the window.
-  #[serde(default)]
-  pub set_fullscreen: bool,
-  /// Allows focusing the window.
-  #[serde(default)]
-  pub set_focus: bool,
-  /// Allows changing the window icon.
-  #[serde(default)]
-  pub set_icon: bool,
-  /// Allows setting the skip_taskbar flag of the window.
-  #[serde(default)]
-  pub set_skip_taskbar: bool,
-  /// Allows start dragging on the window.
-  #[serde(default)]
-  pub start_dragging: bool,
-  /// Allows opening the system dialog to print the window content.
-  #[serde(default)]
-  pub print: bool,
-}
-
-impl Allowlist for WindowAllowlistConfig {
-  fn all_features() -> Vec<&'static str> {
-    let allowlist = Self {
-      all: false,
-      create: true,
-      center: true,
-      request_user_attention: true,
-      set_resizable: true,
-      set_title: true,
-      maximize: true,
-      unmaximize: true,
-      minimize: true,
-      unminimize: true,
-      show: true,
-      hide: true,
-      close: true,
-      set_decorations: true,
-      set_always_on_top: true,
-      set_size: true,
-      set_min_size: true,
-      set_max_size: true,
-      set_position: true,
-      set_fullscreen: true,
-      set_focus: true,
-      set_icon: true,
-      set_skip_taskbar: true,
-      start_dragging: true,
-      print: true,
-    };
-    let mut features = allowlist.to_features();
-    features.push("window-all");
-    features
-  }
-
-  fn to_features(&self) -> Vec<&'static str> {
-    if self.all {
-      vec!["window-all"]
-    } else {
-      let mut features = Vec::new();
-      check_feature!(self, features, create, "window-create");
-      check_feature!(self, features, center, "window-center");
-      check_feature!(
-        self,
-        features,
-        request_user_attention,
-        "window-request-user-attention"
-      );
-      check_feature!(self, features, set_resizable, "window-set-resizable");
-      check_feature!(self, features, set_title, "window-set-title");
-      check_feature!(self, features, maximize, "window-maximize");
-      check_feature!(self, features, unmaximize, "window-unmaximize");
-      check_feature!(self, features, minimize, "window-minimize");
-      check_feature!(self, features, unminimize, "window-unminimize");
-      check_feature!(self, features, show, "window-show");
-      check_feature!(self, features, hide, "window-hide");
-      check_feature!(self, features, close, "window-close");
-      check_feature!(self, features, set_decorations, "window-set-decorations");
-      check_feature!(
-        self,
-        features,
-        set_always_on_top,
-        "window-set-always-on-top"
-      );
-      check_feature!(self, features, set_size, "window-set-size");
-      check_feature!(self, features, set_min_size, "window-set-min-size");
-      check_feature!(self, features, set_max_size, "window-set-max-size");
-      check_feature!(self, features, set_position, "window-set-position");
-      check_feature!(self, features, set_fullscreen, "window-set-fullscreen");
-      check_feature!(self, features, set_focus, "window-set-focus");
-      check_feature!(self, features, set_icon, "window-set-icon");
-      check_feature!(self, features, set_skip_taskbar, "window-set-skip-taskbar");
-      check_feature!(self, features, start_dragging, "window-start-dragging");
-      check_feature!(self, features, print, "window-print");
-      features
-    }
-  }
-}
-
-/// A command allowed to be executed by the webview API.
-#[derive(Debug, PartialEq, Eq, Clone, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-pub struct ShellAllowedCommand {
-  /// The name for this allowed shell command configuration.
+pub struct SecurityConfig {
+  /// The Content Security Policy that will be injected on all HTML files on the built application.
+  /// If [`dev_csp`](#SecurityConfig.devCsp) is not specified, this value is also injected on dev.
   ///
-  /// This name will be used inside of the webview API to call this command along with
-  /// any specified arguments.
-  pub name: String,
-
-  /// The command name.
-  /// It can start with a variable that resolves to a system base directory.
-  /// The variables are: `$AUDIO`, `$CACHE`, `$CONFIG`, `$DATA`, `$LOCALDATA`, `$DESKTOP`,
-  /// `$DOCUMENT`, `$DOWNLOAD`, `$EXE`, `$FONT`, `$HOME`, `$PICTURE`, `$PUBLIC`, `$RUNTIME`,
-  /// `$TEMPLATE`, `$VIDEO`, `$RESOURCE`, `$APP`, `$LOG`, `$TEMP`.
-  #[serde(rename = "cmd", default)] // use default just so the schema doesn't flag it as required
-  pub command: PathBuf,
-
-  /// The allowed arguments for the command execution.
+  /// This is a really important part of the configuration since it helps you ensure your WebView is secured.
+  /// See <https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP>.
+  pub csp: Option<Csp>,
+  /// The Content Security Policy that will be injected on all HTML files on development.
+  ///
+  /// This is a really important part of the configuration since it helps you ensure your WebView is secured.
+  /// See <https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP>.
+  #[serde(alias = "dev-csp")]
+  pub dev_csp: Option<Csp>,
+  /// Freeze the `Object.prototype` when using the custom protocol.
+  #[serde(default, alias = "freeze-prototype")]
+  pub freeze_prototype: bool,
+  /// Disables the Tauri-injected CSP sources.
+  ///
+  /// At compile time, Tauri parses all the frontend assets and changes the Content-Security-Policy
+  /// to only allow loading of your own scripts and styles by injecting nonce and hash sources.
+  /// This stricts your CSP, which may introduce issues when using along with other flexing sources.
+  ///
+  /// This configuration option allows both a boolean and a list of strings as value.
+  /// A boolean instructs Tauri to disable the injection for all CSP injections,
+  /// and a list of strings indicates the CSP directives that Tauri cannot inject.
+  ///
+  /// **WARNING:** Only disable this if you know what you are doing and have properly configured the CSP.
+  /// Your application might be vulnerable to XSS attacks without this Tauri protection.
+  #[serde(default, alias = "dangerous-disable-asset-csp-modification")]
+  pub dangerous_disable_asset_csp_modification: DisabledCspModificationKind,
+  /// Custom protocol config.
+  #[serde(default, alias = "asset-protocol")]
+  pub asset_protocol: AssetProtocolConfig,
+  /// The pattern to use.
   #[serde(default)]
-  pub args: ShellAllowedArgs,
-
-  /// If this command is a sidecar command.
+  pub pattern: PatternKind,
+  /// List of capabilities that are enabled on the application.
+  ///
+  /// If the list is empty, all capabilities are included.
   #[serde(default)]
-  pub sidecar: bool,
+  pub capabilities: Vec<CapabilityEntry>,
 }
 
-impl<'de> Deserialize<'de> for ShellAllowedCommand {
+/// A capability entry which can be either an inlined capability or a reference to a capability defined on its own file.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(untagged)]
+pub enum CapabilityEntry {
+  /// An inlined capability.
+  Inlined(Capability),
+  /// Reference to a capability identifier.
+  Reference(String),
+}
+
+impl<'de> Deserialize<'de> for CapabilityEntry {
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
   where
     D: Deserializer<'de>,
   {
-    #[derive(Deserialize)]
-    struct InnerShellAllowedCommand {
-      name: String,
-      #[serde(rename = "cmd")]
-      command: Option<PathBuf>,
-      #[serde(default)]
-      args: ShellAllowedArgs,
-      #[serde(default)]
-      sidecar: bool,
-    }
-
-    let config = InnerShellAllowedCommand::deserialize(deserializer)?;
-
-    if !config.sidecar && config.command.is_none() {
-      return Err(DeError::custom(
-        "The shell scope `command` value is required.",
-      ));
-    }
-
-    Ok(ShellAllowedCommand {
-      name: config.name,
-      command: config.command.unwrap_or_default(),
-      args: config.args,
-      sidecar: config.sidecar,
-    })
-  }
-}
-
-/// A set of command arguments allowed to be executed by the webview API.
-///
-/// A value of `true` will allow any arguments to be passed to the command. `false` will disable all
-/// arguments. A list of [`ShellAllowedArg`] will set those arguments as the only valid arguments to
-/// be passed to the attached command configuration.
-#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(untagged, deny_unknown_fields)]
-#[non_exhaustive]
-pub enum ShellAllowedArgs {
-  /// Use a simple boolean to allow all or disable all arguments to this command configuration.
-  Flag(bool),
-
-  /// A specific set of [`ShellAllowedArg`] that are valid to call for the command configuration.
-  List(Vec<ShellAllowedArg>),
-}
-
-impl Default for ShellAllowedArgs {
-  fn default() -> Self {
-    Self::Flag(false)
-  }
-}
-
-/// A command argument allowed to be executed by the webview API.
-#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(untagged, deny_unknown_fields)]
-#[non_exhaustive]
-pub enum ShellAllowedArg {
-  /// A non-configurable argument that is passed to the command in the order it was specified.
-  Fixed(String),
-
-  /// A variable that is set while calling the command from the webview API.
-  ///
-  Var {
-    /// [regex] validator to require passed values to conform to an expected input.
-    ///
-    /// This will require the argument value passed to this variable to match the `validator` regex
-    /// before it will be executed.
-    ///
-    /// [regex]: https://docs.rs/regex/latest/regex/#syntax
-    validator: String,
-  },
-}
-
-/// Shell scope definition.
-/// It is a list of command names and associated CLI arguments that restrict the API access from the webview.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-pub struct ShellAllowlistScope(pub Vec<ShellAllowedCommand>);
-
-/// Defines the `shell > open` api scope.
-#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(untagged, deny_unknown_fields)]
-#[non_exhaustive]
-pub enum ShellAllowlistOpen {
-  /// If the shell open API should be enabled.
-  ///
-  /// If enabled, the default validation regex (`^https?://`) is used.
-  Flag(bool),
-
-  /// Enable the shell open API, with a custom regex that the opened path must match against.
-  ///
-  /// If using a custom regex to support a non-http(s) schema, care should be used to prevent values
-  /// that allow flag-like strings to pass validation. e.g. `--enable-debugging`, `-i`, `/R`.
-  Validate(String),
-}
-
-impl Default for ShellAllowlistOpen {
-  fn default() -> Self {
-    Self::Flag(false)
-  }
-}
-
-/// Allowlist for the shell APIs.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ShellAllowlistConfig {
-  /// Access scope for the binary execution APIs.
-  /// Sidecars are automatically enabled.
-  #[serde(default)]
-  pub scope: ShellAllowlistScope,
-  /// Use this flag to enable all shell API features.
-  #[serde(default)]
-  pub all: bool,
-  /// Enable binary execution.
-  #[serde(default)]
-  pub execute: bool,
-  /// Enable sidecar execution, allowing the JavaScript layer to spawn a sidecar command,
-  /// an executable that is shipped with the application.
-  /// For more information see <https://tauri.app/v1/guides/building/sidecar>.
-  #[serde(default)]
-  pub sidecar: bool,
-  /// Open URL with the user's default application.
-  #[serde(default)]
-  pub open: ShellAllowlistOpen,
-}
-
-impl Allowlist for ShellAllowlistConfig {
-  fn all_features() -> Vec<&'static str> {
-    let allowlist = Self {
-      scope: Default::default(),
-      all: false,
-      execute: true,
-      sidecar: true,
-      open: ShellAllowlistOpen::Flag(true),
-    };
-    let mut features = allowlist.to_features();
-    features.push("shell-all");
-    features
-  }
-
-  fn to_features(&self) -> Vec<&'static str> {
-    if self.all {
-      vec!["shell-all"]
-    } else {
-      let mut features = Vec::new();
-      check_feature!(self, features, execute, "shell-execute");
-      check_feature!(self, features, sidecar, "shell-sidecar");
-
-      if !matches!(self.open, ShellAllowlistOpen::Flag(false)) {
-        features.push("shell-open")
-      }
-
-      features
-    }
-  }
-}
-
-/// Allowlist for the dialog APIs.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DialogAllowlistConfig {
-  /// Use this flag to enable all dialog API features.
-  #[serde(default)]
-  pub all: bool,
-  /// Allows the API to open a dialog window to pick files.
-  #[serde(default)]
-  pub open: bool,
-  /// Allows the API to open a dialog window to pick where to save files.
-  #[serde(default)]
-  pub save: bool,
-  /// Allows the API to show a message dialog window.
-  #[serde(default)]
-  pub message: bool,
-  /// Allows the API to show a dialog window with Yes/No buttons.
-  #[serde(default)]
-  pub ask: bool,
-  /// Allows the API to show a dialog window with Ok/Cancel buttons.
-  #[serde(default)]
-  pub confirm: bool,
-}
-
-impl Allowlist for DialogAllowlistConfig {
-  fn all_features() -> Vec<&'static str> {
-    let allowlist = Self {
-      all: false,
-      open: true,
-      save: true,
-      message: true,
-      ask: true,
-      confirm: true,
-    };
-    let mut features = allowlist.to_features();
-    features.push("dialog-all");
-    features
-  }
-
-  fn to_features(&self) -> Vec<&'static str> {
-    if self.all {
-      vec!["dialog-all"]
-    } else {
-      let mut features = Vec::new();
-      check_feature!(self, features, open, "dialog-open");
-      check_feature!(self, features, save, "dialog-save");
-      check_feature!(self, features, message, "dialog-message");
-      check_feature!(self, features, ask, "dialog-ask");
-      check_feature!(self, features, confirm, "dialog-confirm");
-      features
-    }
-  }
-}
-
-/// HTTP API scope definition.
-/// It is a list of URLs that can be accessed by the webview when using the HTTP APIs.
-/// The scoped URL is matched against the request URL using a glob pattern.
-///
-/// Examples:
-/// - "https://**": allows all HTTPS urls
-/// - "https://*.github.com/tauri-apps/tauri": allows any subdomain of "github.com" with the "tauri-apps/api" path
-/// - "https://myapi.service.com/users/*": allows access to any URLs that begins with "https://myapi.service.com/users/"
-#[allow(rustdoc::bare_urls)]
-#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-pub struct HttpAllowlistScope(pub Vec<Url>);
-
-/// Allowlist for the HTTP APIs.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HttpAllowlistConfig {
-  /// The access scope for the HTTP APIs.
-  #[serde(default)]
-  pub scope: HttpAllowlistScope,
-  /// Use this flag to enable all HTTP API features.
-  #[serde(default)]
-  pub all: bool,
-  /// Allows making HTTP requests.
-  #[serde(default)]
-  pub request: bool,
-}
-
-impl Allowlist for HttpAllowlistConfig {
-  fn all_features() -> Vec<&'static str> {
-    let allowlist = Self {
-      scope: Default::default(),
-      all: false,
-      request: true,
-    };
-    let mut features = allowlist.to_features();
-    features.push("http-all");
-    features
-  }
-
-  fn to_features(&self) -> Vec<&'static str> {
-    if self.all {
-      vec!["http-all"]
-    } else {
-      let mut features = Vec::new();
-      check_feature!(self, features, request, "http-request");
-      features
-    }
-  }
-}
-
-/// Allowlist for the notification APIs.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct NotificationAllowlistConfig {
-  /// Use this flag to enable all notification API features.
-  #[serde(default)]
-  pub all: bool,
-}
-
-impl Allowlist for NotificationAllowlistConfig {
-  fn all_features() -> Vec<&'static str> {
-    let allowlist = Self { all: false };
-    let mut features = allowlist.to_features();
-    features.push("notification-all");
-    features
-  }
-
-  fn to_features(&self) -> Vec<&'static str> {
-    if self.all {
-      vec!["notification-all"]
-    } else {
-      vec![]
-    }
-  }
-}
-
-/// Allowlist for the global shortcut APIs.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct GlobalShortcutAllowlistConfig {
-  /// Use this flag to enable all global shortcut API features.
-  #[serde(default)]
-  pub all: bool,
-}
-
-impl Allowlist for GlobalShortcutAllowlistConfig {
-  fn all_features() -> Vec<&'static str> {
-    let allowlist = Self { all: false };
-    let mut features = allowlist.to_features();
-    features.push("global-shortcut-all");
-    features
-  }
-
-  fn to_features(&self) -> Vec<&'static str> {
-    if self.all {
-      vec!["global-shortcut-all"]
-    } else {
-      vec![]
-    }
-  }
-}
-
-/// Allowlist for the OS APIs.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct OsAllowlistConfig {
-  /// Use this flag to enable all OS API features.
-  #[serde(default)]
-  pub all: bool,
-}
-
-impl Allowlist for OsAllowlistConfig {
-  fn all_features() -> Vec<&'static str> {
-    let allowlist = Self { all: false };
-    let mut features = allowlist.to_features();
-    features.push("os-all");
-    features
-  }
-
-  fn to_features(&self) -> Vec<&'static str> {
-    if self.all {
-      vec!["os-all"]
-    } else {
-      vec![]
-    }
-  }
-}
-
-/// Allowlist for the path APIs.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PathAllowlistConfig {
-  /// Use this flag to enable all path API features.
-  #[serde(default)]
-  pub all: bool,
-}
-
-impl Allowlist for PathAllowlistConfig {
-  fn all_features() -> Vec<&'static str> {
-    let allowlist = Self { all: false };
-    let mut features = allowlist.to_features();
-    features.push("path-all");
-    features
-  }
-
-  fn to_features(&self) -> Vec<&'static str> {
-    if self.all {
-      vec!["path-all"]
-    } else {
-      vec![]
-    }
-  }
-}
-
-/// Allowlist for the custom protocols.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProtocolAllowlistConfig {
-  /// The access scope for the asset protocol.
-  #[serde(default)]
-  pub asset_scope: FsAllowlistScope,
-  /// Use this flag to enable all custom protocols.
-  #[serde(default)]
-  pub all: bool,
-  /// Enables the asset protocol.
-  #[serde(default)]
-  pub asset: bool,
-}
-
-impl Allowlist for ProtocolAllowlistConfig {
-  fn all_features() -> Vec<&'static str> {
-    let allowlist = Self {
-      asset_scope: Default::default(),
-      all: false,
-      asset: true,
-    };
-    let mut features = allowlist.to_features();
-    features.push("protocol-all");
-    features
-  }
-
-  fn to_features(&self) -> Vec<&'static str> {
-    if self.all {
-      vec!["protocol-all"]
-    } else {
-      let mut features = Vec::new();
-      check_feature!(self, features, asset, "protocol-asset");
-      features
-    }
-  }
-}
-
-/// Allowlist for the process APIs.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProcessAllowlistConfig {
-  /// Use this flag to enable all process APIs.
-  #[serde(default)]
-  pub all: bool,
-  /// Enables the relaunch API.
-  #[serde(default)]
-  pub relaunch: bool,
-  /// Dangerous option that allows macOS to relaunch even if the binary contains a symlink.
-  ///
-  /// This is due to macOS having less symlink protection. Highly recommended to not set this flag
-  /// unless you have a very specific reason too, and understand the implications of it.
-  #[serde(default)]
-  pub relaunch_dangerous_allow_symlink_macos: bool,
-  /// Enables the exit API.
-  #[serde(default)]
-  pub exit: bool,
-}
-
-impl Allowlist for ProcessAllowlistConfig {
-  fn all_features() -> Vec<&'static str> {
-    let allowlist = Self {
-      all: false,
-      relaunch: true,
-      relaunch_dangerous_allow_symlink_macos: false,
-      exit: true,
-    };
-    let mut features = allowlist.to_features();
-    features.push("process-all");
-    features
-  }
-
-  fn to_features(&self) -> Vec<&'static str> {
-    if self.all {
-      vec!["process-all"]
-    } else {
-      let mut features = Vec::new();
-      check_feature!(self, features, relaunch, "process-relaunch");
-      check_feature!(
-        self,
-        features,
-        relaunch_dangerous_allow_symlink_macos,
-        "process-relaunch-dangerous-allow-symlink-macos"
-      );
-      check_feature!(self, features, exit, "process-exit");
-      features
-    }
-  }
-}
-
-/// Allowlist for the clipboard APIs.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ClipboardAllowlistConfig {
-  /// Use this flag to enable all clipboard APIs.
-  #[serde(default)]
-  pub all: bool,
-  /// Enables the clipboard's `writeText` API.
-  #[serde(default)]
-  pub write_text: bool,
-  /// Enables the clipboard's `readText` API.
-  #[serde(default)]
-  pub read_text: bool,
-}
-
-impl Allowlist for ClipboardAllowlistConfig {
-  fn all_features() -> Vec<&'static str> {
-    let allowlist = Self {
-      all: false,
-      write_text: true,
-      read_text: true,
-    };
-    let mut features = allowlist.to_features();
-    features.push("clipboard-all");
-    features
-  }
-
-  fn to_features(&self) -> Vec<&'static str> {
-    if self.all {
-      vec!["clipboard-all"]
-    } else {
-      let mut features = Vec::new();
-      check_feature!(self, features, write_text, "clipboard-write-text");
-      check_feature!(self, features, read_text, "clipboard-read-text");
-      features
-    }
-  }
-}
-
-/// Allowlist configuration.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AllowlistConfig {
-  /// Use this flag to enable all API features.
-  #[serde(default)]
-  pub all: bool,
-  /// File system API allowlist.
-  #[serde(default)]
-  pub fs: FsAllowlistConfig,
-  /// Window API allowlist.
-  #[serde(default)]
-  pub window: WindowAllowlistConfig,
-  /// Shell API allowlist.
-  #[serde(default)]
-  pub shell: ShellAllowlistConfig,
-  /// Dialog API allowlist.
-  #[serde(default)]
-  pub dialog: DialogAllowlistConfig,
-  /// HTTP API allowlist.
-  #[serde(default)]
-  pub http: HttpAllowlistConfig,
-  /// Notification API allowlist.
-  #[serde(default)]
-  pub notification: NotificationAllowlistConfig,
-  /// Global shortcut API allowlist.
-  #[serde(default)]
-  pub global_shortcut: GlobalShortcutAllowlistConfig,
-  /// OS allowlist.
-  #[serde(default)]
-  pub os: OsAllowlistConfig,
-  /// Path API allowlist.
-  #[serde(default)]
-  pub path: PathAllowlistConfig,
-  /// Custom protocol allowlist.
-  #[serde(default)]
-  pub protocol: ProtocolAllowlistConfig,
-  /// Process API allowlist.
-  #[serde(default)]
-  pub process: ProcessAllowlistConfig,
-  /// Clipboard APIs allowlist.
-  #[serde(default)]
-  pub clipboard: ClipboardAllowlistConfig,
-}
-
-impl Allowlist for AllowlistConfig {
-  fn all_features() -> Vec<&'static str> {
-    let mut features = vec!["api-all"];
-    features.extend(FsAllowlistConfig::all_features());
-    features.extend(WindowAllowlistConfig::all_features());
-    features.extend(ShellAllowlistConfig::all_features());
-    features.extend(DialogAllowlistConfig::all_features());
-    features.extend(HttpAllowlistConfig::all_features());
-    features.extend(NotificationAllowlistConfig::all_features());
-    features.extend(GlobalShortcutAllowlistConfig::all_features());
-    features.extend(OsAllowlistConfig::all_features());
-    features.extend(PathAllowlistConfig::all_features());
-    features.extend(ProtocolAllowlistConfig::all_features());
-    features.extend(ProcessAllowlistConfig::all_features());
-    features.extend(ClipboardAllowlistConfig::all_features());
-    features
-  }
-
-  fn to_features(&self) -> Vec<&'static str> {
-    if self.all {
-      vec!["api-all"]
-    } else {
-      let mut features = Vec::new();
-      features.extend(self.fs.to_features());
-      features.extend(self.window.to_features());
-      features.extend(self.shell.to_features());
-      features.extend(self.dialog.to_features());
-      features.extend(self.http.to_features());
-      features.extend(self.notification.to_features());
-      features.extend(self.global_shortcut.to_features());
-      features.extend(self.os.to_features());
-      features.extend(self.path.to_features());
-      features.extend(self.protocol.to_features());
-      features.extend(self.process.to_features());
-      features.extend(self.clipboard.to_features());
-      features
-    }
+    UntaggedEnumVisitor::new()
+      .string(|string| Ok(Self::Reference(string.to_owned())))
+      .map(|map| map.deserialize::<Capability>().map(Self::Inlined))
+      .deserialize(deserializer)
   }
 }
 
@@ -1935,7 +1768,6 @@ pub enum PatternKind {
   /// Brownfield pattern.
   Brownfield,
   /// Isolation pattern. Recommended for security purposes.
-  #[cfg(feature = "isolation")]
   Isolation {
     /// The dir containing the index.html file that contains the secure isolation application.
     dir: PathBuf,
@@ -1948,293 +1780,140 @@ impl Default for PatternKind {
   }
 }
 
-/// The Tauri configuration object.
+/// The App configuration object.
+///
+/// See more: <https://tauri.app/v1/api/config#appconfig>
 #[skip_serializing_none]
 #[derive(Debug, Default, PartialEq, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TauriConfig {
-  /// The pattern to use.
-  #[serde(default)]
-  pub pattern: PatternKind,
+pub struct AppConfig {
   /// The windows configuration.
   #[serde(default)]
   pub windows: Vec<WindowConfig>,
-  /// The CLI configuration.
-  pub cli: Option<CliConfig>,
-  /// The bundler configuration.
-  #[serde(default)]
-  pub bundle: BundleConfig,
-  /// The allowlist configuration.
-  #[serde(default)]
-  pub allowlist: AllowlistConfig,
   /// Security configuration.
   #[serde(default)]
   pub security: SecurityConfig,
-  /// The updater configuration.
-  #[serde(default)]
-  pub updater: UpdaterConfig,
-  /// Configuration for app system tray.
-  pub system_tray: Option<SystemTrayConfig>,
+  /// Configuration for app tray icon.
+  #[serde(alias = "tray-icon")]
+  pub tray_icon: Option<TrayIconConfig>,
   /// MacOS private API configuration. Enables the transparent background API and sets the `fullScreenEnabled` preference to `true`.
-  #[serde(rename = "macOSPrivateApi", default)]
+  #[serde(rename = "macOSPrivateApi", alias = "macos-private-api", default)]
   pub macos_private_api: bool,
+  /// Whether we should inject the Tauri API on `window.__TAURI__` or not.
+  #[serde(default, alias = "with-global-tauri")]
+  pub with_global_tauri: bool,
+  /// If set to true "identifier" will be set as GTK app ID (on systems that use GTK).
+  #[serde(rename = "enableGTKAppId", alias = "enable-gtk-app-id", default)]
+  pub enable_gtk_app_id: bool,
 }
 
-impl TauriConfig {
+impl AppConfig {
   /// Returns all Cargo features.
-  #[allow(dead_code)]
   pub fn all_features() -> Vec<&'static str> {
-    let mut features = AllowlistConfig::all_features();
-    features.extend(vec![
-      "cli",
-      "updater",
-      "system-tray",
+    vec![
+      "tray-icon",
       "macos-private-api",
+      "protocol-asset",
       "isolation",
-    ]);
-    features
+    ]
   }
 
   /// Returns the enabled Cargo features.
-  #[allow(dead_code)]
   pub fn features(&self) -> Vec<&str> {
-    let mut features = self.allowlist.to_features();
-    if self.cli.is_some() {
-      features.push("cli");
-    }
-    if self.updater.active {
-      features.push("updater");
-    }
-    if self.system_tray.is_some() {
-      features.push("system-tray");
+    let mut features = Vec::new();
+    if self.tray_icon.is_some() {
+      features.push("tray-icon");
     }
     if self.macos_private_api {
       features.push("macos-private-api");
     }
-    #[cfg(feature = "isolation")]
-    if let PatternKind::Isolation { .. } = self.pattern {
+    if self.security.asset_protocol.enable {
+      features.push("protocol-asset");
+    }
+
+    if let PatternKind::Isolation { .. } = self.security.pattern {
       features.push("isolation");
     }
+
     features.sort_unstable();
     features
   }
 }
 
-/// A URL to an updater server.
+/// Configuration for application tray icon.
 ///
-/// The URL must use the `https` scheme on production.
-#[skip_serializing_none]
-#[derive(Debug, PartialEq, Eq, Clone, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-pub struct UpdaterEndpoint(pub Url);
-
-impl std::fmt::Display for UpdaterEndpoint {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    write!(f, "{}", self.0)
-  }
-}
-
-impl<'de> Deserialize<'de> for UpdaterEndpoint {
-  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-  where
-    D: Deserializer<'de>,
-  {
-    let url = Url::deserialize(deserializer)?;
-    #[cfg(all(not(debug_assertions), not(feature = "schema")))]
-    {
-      if url.scheme() != "https" {
-        return Err(serde::de::Error::custom(
-          "The configured updater endpoint must use the `https` protocol.",
-        ));
-      }
-    }
-    Ok(Self(url))
-  }
-}
-
-/// Install modes for the Windows update.
-#[derive(Debug, PartialEq, Eq, Clone)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[cfg_attr(feature = "schema", schemars(rename_all = "camelCase"))]
-pub enum WindowsUpdateInstallMode {
-  /// Specifies there's a basic UI during the installation process, including a final dialog box at the end.
-  BasicUi,
-  /// The quiet mode means there's no user interaction required.
-  /// Requires admin privileges if the installer does.
-  Quiet,
-  /// Specifies unattended mode, which means the installation only shows a progress bar.
-  Passive,
-}
-
-impl WindowsUpdateInstallMode {
-  /// Returns the associated `msiexec.exe` arguments.
-  pub fn msiexec_args(&self) -> &'static [&'static str] {
-    match self {
-      Self::BasicUi => &["/qb+"],
-      Self::Quiet => &["/quiet"],
-      Self::Passive => &["/passive"],
-    }
-  }
-}
-
-impl Display for WindowsUpdateInstallMode {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    write!(
-      f,
-      "{}",
-      match self {
-        Self::BasicUi => "basicUI",
-        Self::Quiet => "quiet",
-        Self::Passive => "passive",
-      }
-    )
-  }
-}
-
-impl Default for WindowsUpdateInstallMode {
-  fn default() -> Self {
-    Self::Passive
-  }
-}
-
-impl Serialize for WindowsUpdateInstallMode {
-  fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-  where
-    S: Serializer,
-  {
-    serializer.serialize_str(self.to_string().as_ref())
-  }
-}
-
-impl<'de> Deserialize<'de> for WindowsUpdateInstallMode {
-  fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-  where
-    D: Deserializer<'de>,
-  {
-    let s = String::deserialize(deserializer)?;
-    match s.to_lowercase().as_str() {
-      "basicui" => Ok(Self::BasicUi),
-      "quiet" => Ok(Self::Quiet),
-      "passive" => Ok(Self::Passive),
-      _ => Err(DeError::custom(format!(
-        "unknown update install mode '{}'",
-        s
-      ))),
-    }
-  }
-}
-
-/// The updater configuration for Windows.
-#[skip_serializing_none]
-#[derive(Debug, Default, PartialEq, Eq, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct UpdaterWindowsConfig {
-  /// The installation mode for the update on Windows. Defaults to `passive`.
-  #[serde(default)]
-  pub install_mode: WindowsUpdateInstallMode,
-}
-
-/// The Updater configuration object.
-#[skip_serializing_none]
-#[derive(Debug, PartialEq, Eq, Clone, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct UpdaterConfig {
-  /// Whether the updater is active or not.
-  #[serde(default)]
-  pub active: bool,
-  /// Display built-in dialog or use event system if disabled.
-  #[serde(default = "default_dialog")]
-  pub dialog: bool,
-  /// The updater endpoints. TLS is enforced on production.
-  ///
-  /// The updater URL can contain the following variables:
-  /// - {{current_version}}: The version of the app that is requesting the update
-  /// - {{target}}: The operating system name (one of `linux`, `windows` or `darwin`).
-  /// - {{arch}}: The architecture of the machine (one of `x86_64`, `i686`, `aarch64` or `armv7`).
-  ///
-  /// # Examples
-  /// - "https://my.cdn.com/latest.json": a raw JSON endpoint that returns the latest version and download links for each platform.
-  /// - "https://updates.app.dev/{{target}}?version={{current_version}}&arch={{arch}}": a dedicated API with positional and query string arguments.
-  #[allow(rustdoc::bare_urls)]
-  pub endpoints: Option<Vec<UpdaterEndpoint>>,
-  /// Signature public key.
-  #[serde(default)] // use default just so the schema doesn't flag it as required
-  pub pubkey: String,
-  /// The Windows configuration for the updater.
-  #[serde(default)]
-  pub windows: UpdaterWindowsConfig,
-}
-
-impl<'de> Deserialize<'de> for UpdaterConfig {
-  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-  where
-    D: Deserializer<'de>,
-  {
-    #[derive(Deserialize)]
-    struct InnerUpdaterConfig {
-      #[serde(default)]
-      active: bool,
-      #[serde(default = "default_dialog")]
-      dialog: bool,
-      endpoints: Option<Vec<UpdaterEndpoint>>,
-      pubkey: Option<String>,
-      #[serde(default)]
-      windows: UpdaterWindowsConfig,
-    }
-
-    let config = InnerUpdaterConfig::deserialize(deserializer)?;
-
-    if config.active && config.pubkey.is_none() {
-      return Err(DeError::custom(
-        "The updater `pubkey` configuration is required.",
-      ));
-    }
-
-    Ok(UpdaterConfig {
-      active: config.active,
-      dialog: config.dialog,
-      endpoints: config.endpoints,
-      pubkey: config.pubkey.unwrap_or_default(),
-      windows: config.windows,
-    })
-  }
-}
-
-impl Default for UpdaterConfig {
-  fn default() -> Self {
-    Self {
-      active: false,
-      dialog: default_dialog(),
-      endpoints: None,
-      pubkey: "".into(),
-      windows: Default::default(),
-    }
-  }
-}
-
-/// Configuration for application system tray icon.
+/// See more: <https://tauri.app/v1/api/config#trayiconconfig>
 #[skip_serializing_none]
 #[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SystemTrayConfig {
-  /// Path to the icon to use on the system tray.
+pub struct TrayIconConfig {
+  /// Set an id for this tray icon so you can reference it later, defaults to `main`.
+  pub id: Option<String>,
+  /// Path to the default icon to use for the tray icon.
   ///
-  /// It is forced to be a `.png` file on Linux and macOS, and a `.ico` file on Windows.
+  /// Note: this stores the image in raw pixels to the final binary,
+  /// so keep the icon size (width and height) small
+  /// or else it's going to bloat your final executable
+  #[serde(alias = "icon-path")]
   pub icon_path: PathBuf,
   /// A Boolean value that determines whether the image represents a [template](https://developer.apple.com/documentation/appkit/nsimage/1520017-template?language=objc) image on macOS.
-  #[serde(default)]
+  #[serde(default, alias = "icon-as-template")]
   pub icon_as_template: bool,
+  /// A Boolean value that determines whether the menu should appear when the tray icon receives a left click on macOS.
+  #[serde(default = "default_true", alias = "menu-on-left-click")]
+  pub menu_on_left_click: bool,
+  /// Title for MacOS tray
+  pub title: Option<String>,
+  /// Tray icon tooltip on Windows and macOS
+  pub tooltip: Option<String>,
 }
 
-// We enable the unnecessary_wraps because we need
-// to use an Option for dialog otherwise the CLI schema will mark
-// the dialog as a required field which is not as we default it to true.
-fn default_dialog() -> bool {
-  true
+/// General configuration for the iOS target.
+#[skip_serializing_none]
+#[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IosConfig {
+  /// The development team. This value is required for iOS development because code signing is enforced.
+  /// The `APPLE_DEVELOPMENT_TEAM` environment variable can be set to overwrite it.
+  #[serde(alias = "development-team")]
+  pub development_team: Option<String>,
+}
+
+/// General configuration for the iOS target.
+#[skip_serializing_none]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AndroidConfig {
+  /// The minimum API level required for the application to run.
+  /// The Android system will prevent the user from installing the application if the system's API level is lower than the value specified.
+  #[serde(alias = "min-sdk-version", default = "default_min_sdk_version")]
+  pub min_sdk_version: u32,
+
+  /// The version code of the application.
+  /// It is limited to 2,100,000,000 as per Google Play Store requirements.
+  ///
+  /// By default we use your configured version and perform the following math:
+  /// versionCode = version.major * 1000000 + version.minor * 1000 + version.patch
+  #[serde(alias = "version-code")]
+  #[cfg_attr(feature = "schema", validate(range(min = 1, max = 2_100_000_000)))]
+  pub version_code: Option<u32>,
+}
+
+impl Default for AndroidConfig {
+  fn default() -> Self {
+    Self {
+      min_sdk_version: default_min_sdk_version(),
+      version_code: None,
+    }
+  }
+}
+
+fn default_min_sdk_version() -> u32 {
+  24
 }
 
 /// Defines the URL or assets to embed in the application.
@@ -2242,96 +1921,118 @@ fn default_dialog() -> bool {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(untagged, deny_unknown_fields)]
 #[non_exhaustive]
-pub enum AppUrl {
-  /// The app's external URL, or the path to the directory containing the app assets.
-  Url(WindowUrl),
+pub enum FrontendDist {
+  /// An external URL that should be used as the default application URL.
+  Url(Url),
+  /// Path to a directory containing the frontend dist assets.
+  Directory(PathBuf),
   /// An array of files to embed on the app.
   Files(Vec<PathBuf>),
 }
 
-impl std::fmt::Display for AppUrl {
+impl std::fmt::Display for FrontendDist {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
-      Self::Url(url) => write!(f, "{}", url),
+      Self::Url(url) => write!(f, "{url}"),
+      Self::Directory(p) => write!(f, "{}", p.display()),
       Self::Files(files) => write!(f, "{}", serde_json::to_string(files).unwrap()),
     }
   }
 }
 
-/// The Build configuration object.
-#[skip_serializing_none]
+/// Describes the shell command to run before `tauri dev`.
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", untagged)]
+pub enum BeforeDevCommand {
+  /// Run the given script with the default options.
+  Script(String),
+  /// Run the given script with custom options.
+  ScriptWithOptions {
+    /// The script to execute.
+    script: String,
+    /// The current working directory.
+    cwd: Option<String>,
+    /// Whether `tauri dev` should wait for the command to finish or not. Defaults to `false`.
+    #[serde(default)]
+    wait: bool,
+  },
+}
+
+/// Describes a shell command to be executed when a CLI hook is triggered.
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", untagged)]
+pub enum HookCommand {
+  /// Run the given script with the default options.
+  Script(String),
+  /// Run the given script with custom options.
+  ScriptWithOptions {
+    /// The script to execute.
+    script: String,
+    /// The current working directory.
+    cwd: Option<String>,
+  },
+}
+
+/// The Build configuration object.
+///
+/// See more: <https://tauri.app/v1/api/config#buildconfig>
+#[skip_serializing_none]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize, Default)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BuildConfig {
   /// The binary used to build and run the application.
   pub runner: Option<String>,
-  /// The path to the application assets or URL to load in development.
+  /// The URL to load in development.
   ///
-  /// This is usually an URL to a dev server, which serves your application assets
-  /// with live reloading. Most modern JavaScript bundlers provides a way to start a dev server by default.
+  /// This is usually an URL to a dev server, which serves your application assets with hot-reload and HMR.
+  /// Most modern JavaScript bundlers like [vite](https://vitejs.dev/guide/) provides a way to start a dev server by default.
   ///
-  /// See [vite](https://vitejs.dev/guide/), [Webpack DevServer](https://webpack.js.org/configuration/dev-server/) and [sirv](https://github.com/lukeed/sirv)
-  /// for examples on how to set up a dev server.
-  #[serde(default = "default_dev_path")]
-  pub dev_path: AppUrl,
-  /// The path to the application assets or URL to load in production.
+  /// If you don't have a dev server or don't want to use one, ignore this option and use [`frontendDist`](BuildConfig::frontend_dist)
+  /// and point to a web assets directory, and Tauri CLI will run its built-in dev server and provide a simple hot-reload experience.
+  #[serde(alias = "dev-url")]
+  pub dev_url: Option<Url>,
+  /// The path to the application assets (usually the `dist` folder of your javascript bundler)
+  /// or a URL that could be either a custom protocol registered in the tauri app (for example: `myprotocol://`)
+  /// or a remote URL (for example: `https://site.com/app`).
   ///
   /// When a path relative to the configuration file is provided,
   /// it is read recursively and all files are embedded in the application binary.
-  /// Tauri then looks for an `index.html` file unless you provide a custom window URL.
+  /// Tauri then looks for an `index.html` and serves it as the default entry point for your application.
   ///
   /// You can also provide a list of paths to be embedded, which allows granular control over what files are added to the binary.
   /// In this case, all files are added to the root and you must reference it that way in your HTML files.
   ///
-  /// When an URL is provided, the application won't have bundled assets
+  /// When a URL is provided, the application won't have bundled assets
   /// and the application will load that URL by default.
-  #[serde(default = "default_dist_dir")]
-  pub dist_dir: AppUrl,
+  #[serde(alias = "frontend-dist")]
+  pub frontend_dist: Option<FrontendDist>,
   /// A shell command to run before `tauri dev` kicks in.
   ///
-  /// The TAURI_PLATFORM, TAURI_ARCH, TAURI_FAMILY, TAURI_PLATFORM_VERSION, TAURI_PLATFORM_TYPE and TAURI_DEBUG environment variables are set if you perform conditional compilation.
-  pub before_dev_command: Option<String>,
+  /// The TAURI_ENV_PLATFORM, TAURI_ENV_ARCH, TAURI_ENV_FAMILY, TAURI_ENV_PLATFORM_VERSION, TAURI_ENV_PLATFORM_TYPE and TAURI_ENV_DEBUG environment variables are set if you perform conditional compilation.
+  #[serde(alias = "before-dev-command")]
+  pub before_dev_command: Option<BeforeDevCommand>,
   /// A shell command to run before `tauri build` kicks in.
   ///
-  /// The TAURI_PLATFORM, TAURI_ARCH, TAURI_FAMILY, TAURI_PLATFORM_VERSION, TAURI_PLATFORM_TYPE and TAURI_DEBUG environment variables are set if you perform conditional compilation.
-  pub before_build_command: Option<String>,
+  /// The TAURI_ENV_PLATFORM, TAURI_ENV_ARCH, TAURI_ENV_FAMILY, TAURI_ENV_PLATFORM_VERSION, TAURI_ENV_PLATFORM_TYPE and TAURI_ENV_DEBUG environment variables are set if you perform conditional compilation.
+  #[serde(alias = "before-build-command")]
+  pub before_build_command: Option<HookCommand>,
+  /// A shell command to run before the bundling phase in `tauri build` kicks in.
+  ///
+  /// The TAURI_ENV_PLATFORM, TAURI_ENV_ARCH, TAURI_ENV_FAMILY, TAURI_ENV_PLATFORM_VERSION, TAURI_ENV_PLATFORM_TYPE and TAURI_ENV_DEBUG environment variables are set if you perform conditional compilation.
+  #[serde(alias = "before-bundle-command")]
+  pub before_bundle_command: Option<HookCommand>,
   /// Features passed to `cargo` commands.
   pub features: Option<Vec<String>>,
-  /// Whether we should inject the Tauri API on `window.__TAURI__` or not.
-  #[serde(default)]
-  pub with_global_tauri: bool,
-}
-
-impl Default for BuildConfig {
-  fn default() -> Self {
-    Self {
-      runner: None,
-      dev_path: default_dev_path(),
-      dist_dir: default_dist_dir(),
-      before_dev_command: None,
-      before_build_command: None,
-      features: None,
-      with_global_tauri: false,
-    }
-  }
-}
-
-fn default_dev_path() -> AppUrl {
-  AppUrl::Url(WindowUrl::External(
-    Url::parse("http://localhost:8080").unwrap(),
-  ))
-}
-
-fn default_dist_dir() -> AppUrl {
-  AppUrl::Url(WindowUrl::App("../dist".into()))
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct PackageVersion(String);
 
 impl<'d> serde::Deserialize<'d> for PackageVersion {
-  fn deserialize<D: Deserializer<'d>>(deserializer: D) -> Result<PackageVersion, D::Error> {
+  fn deserialize<D: Deserializer<'d>>(deserializer: D) -> Result<Self, D::Error> {
     struct PackageVersionVisitor;
 
     impl<'d> Visitor<'d> for PackageVersionVisitor {
@@ -2348,9 +2049,9 @@ impl<'d> serde::Deserialize<'d> for PackageVersion {
         let path = PathBuf::from(value);
         if path.exists() {
           let json_str = read_to_string(&path)
-            .map_err(|e| DeError::custom(format!("failed to read version JSON file: {}", e)))?;
+            .map_err(|e| DeError::custom(format!("failed to read version JSON file: {e}")))?;
           let package_json: serde_json::Value = serde_json::from_str(&json_str)
-            .map_err(|e| DeError::custom(format!("failed to read version JSON file: {}", e)))?;
+            .map_err(|e| DeError::custom(format!("failed to read version JSON file: {e}")))?;
           if let Some(obj) = package_json.as_object() {
             let version = obj
               .get("version")
@@ -2383,18 +2084,6 @@ impl<'d> serde::Deserialize<'d> for PackageVersion {
   }
 }
 
-/// The package configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PackageConfig {
-  /// App name.
-  pub product_name: Option<String>,
-  /// App version. It is a semver version number or a path to a `package.json` file contaning the `version` field.
-  #[serde(deserialize_with = "version_deserializer", default)]
-  pub version: Option<String>,
-}
-
 fn version_deserializer<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
   D: Deserializer<'de>,
@@ -2402,65 +2091,54 @@ where
   Option::<PackageVersion>::deserialize(deserializer).map(|v| v.map(|v| v.0))
 }
 
-impl PackageConfig {
-  /// The binary name.
-  #[allow(dead_code)]
-  pub fn binary_name(&self) -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-      self.product_name.as_ref().map(|n| n.to_kebab_case())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-      self.product_name.clone()
-    }
-  }
-}
-
-/// The tauri.conf.json is a file generated by the
+/// The Tauri configuration object.
+/// It is read from a file where you can define your frontend assets,
+/// configure the bundler and define a tray icon.
+///
+/// The configuration file is generated by the
 /// [`tauri init`](https://tauri.app/v1/api/cli#init) command that lives in
 /// your Tauri application source directory (src-tauri).
 ///
 /// Once generated, you may modify it at will to customize your Tauri application.
 ///
+/// ## File Formats
+///
+/// By default, the configuration is defined as a JSON file named `tauri.conf.json`.
+///
+/// Tauri also supports JSON5 and TOML files via the `config-json5` and `config-toml` Cargo features, respectively.
+/// The JSON5 file name must be either `tauri.conf.json` or `tauri.conf.json5`.
+/// The TOML file name is `Tauri.toml`.
+///
 /// ## Platform-Specific Configuration
 ///
-/// In addition to the JSON defined on the `tauri.conf.json` file, Tauri can
+/// In addition to the default configuration file, Tauri can
 /// read a platform-specific configuration from `tauri.linux.conf.json`,
-/// `tauri.windows.conf.json`, and `tauri.macos.conf.json` and merges it with
-/// the main `tauri.conf.json` configuration.
+/// `tauri.windows.conf.json`, `tauri.macos.conf.json`, `tauri.android.conf.json` and `tauri.ios.conf.json`
+/// (or `Tauri.linux.toml`, `Tauri.windows.toml`, `Tauri.macos.toml`, `Tauri.android.toml` and `Tauri.ios.toml` if the `Tauri.toml` format is used),
+/// which gets merged with the main configuration object.
 ///
 /// ## Configuration Structure
 ///
-/// `tauri.conf.json` is composed of the following objects:
+/// The configuration is composed of the following objects:
 ///
-/// - [`package`](#packageconfig): Package settings
-/// - [`tauri`](#tauriconfig): The Tauri config
+/// - [`app`](#appconfig): The Tauri configuration
 /// - [`build`](#buildconfig): The build configuration
-/// - [`plugins`](#pluginconfig): The plugins config
+/// - [`bundle`](#bundleconfig): The bundle configurations
+/// - [`plugins`](#pluginconfig): The plugins configuration
 ///
 /// ```json title="Example tauri.config.json file"
 /// {
+///   "productName": "tauri-app",
+///   "version": "0.1.0",
 ///   "build": {
 ///     "beforeBuildCommand": "",
 ///     "beforeDevCommand": "",
-///     "devPath": "../dist",
-///     "distDir": "../dist"
+///     "devUrl": "../dist",
+///     "frontendDist": "../dist"
 ///   },
-///   "package": {
-///     "productName": "tauri-app",
-///     "version": "0.1.0"
-///   },
-///   "tauri": {
-///     "allowlist": {
-///       "all": true
-///     },
-///     "bundle": {},
+///   "app": {
 ///     "security": {
 ///       "csp": null
-///     },
-///     "updater": {
-///       "active": false
 ///     },
 ///     "windows": [
 ///       {
@@ -2471,7 +2149,9 @@ impl PackageConfig {
 ///         "width": 800
 ///       }
 ///     ]
-///   }
+///   },
+///   "bundle": {},
+///   "plugins": {}
 /// }
 /// ```
 #[skip_serializing_none]
@@ -2482,21 +2162,39 @@ pub struct Config {
   /// The JSON schema for the Tauri config.
   #[serde(rename = "$schema")]
   pub schema: Option<String>,
-  /// Package settings.
+  /// App name.
+  #[serde(alias = "product-name")]
+  #[cfg_attr(feature = "schema", validate(regex(pattern = "^[^/\\:*?\"<>|]+$")))]
+  pub product_name: Option<String>,
+  /// App version. It is a semver version number or a path to a `package.json` file containing the `version` field. If removed the version number from `Cargo.toml` is used.
+  ///
+  /// By default version 1.0 is used on Android.
+  #[serde(deserialize_with = "version_deserializer", default)]
+  pub version: Option<String>,
+  /// The application identifier in reverse domain name notation (e.g. `com.tauri.example`).
+  /// This string must be unique across applications since it is used in system configurations like
+  /// the bundle ID and path to the webview data directory.
+  /// This string must contain only alphanumeric characters (A–Z, a–z, and 0–9), hyphens (-),
+  /// and periods (.).
   #[serde(default)]
-  pub package: PackageConfig,
-  /// The Tauri configuration.
+  pub identifier: String,
+  /// The App configuration.
   #[serde(default)]
-  pub tauri: TauriConfig,
+  pub app: AppConfig,
   /// The build configuration.
   #[serde(default = "default_build")]
   pub build: BuildConfig,
+  /// The bundler configuration.
+  #[serde(default)]
+  pub bundle: BundleConfig,
   /// The plugins config.
   #[serde(default)]
   pub plugins: PluginConfig,
 }
 
 /// The plugin configs holds a HashMap mapping a plugin name to its configuration object.
+///
+/// See more: <https://tauri.app/v1/api/config#pluginconfig>
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct PluginConfig(pub HashMap<String, JsonValue>);
@@ -2504,12 +2202,12 @@ pub struct PluginConfig(pub HashMap<String, JsonValue>);
 fn default_build() -> BuildConfig {
   BuildConfig {
     runner: None,
-    dev_path: default_dev_path(),
-    dist_dir: default_dist_dir(),
+    dev_url: None,
+    frontend_dist: None,
     before_dev_command: None,
     before_build_command: None,
+    before_bundle_command: None,
     features: None,
-    with_global_tauri: false,
   }
 }
 
@@ -2520,175 +2218,28 @@ fn default_build() -> BuildConfig {
 /// application using tauri while only parsing it once (in the build script).
 #[cfg(feature = "build")]
 mod build {
-  use std::{convert::identity, path::Path};
-
+  use super::*;
+  use crate::{literal_struct, tokens::*};
   use proc_macro2::TokenStream;
   use quote::{quote, ToTokens, TokenStreamExt};
+  use std::convert::identity;
 
-  use super::*;
-
-  use serde_json::Value as JsonValue;
-
-  /// Create a `String` constructor `TokenStream`.
-  ///
-  /// e.g. `"Hello World" -> String::from("Hello World").
-  /// This takes a `&String` to reduce casting all the `&String` -> `&str` manually.
-  fn str_lit(s: impl AsRef<str>) -> TokenStream {
-    let s = s.as_ref();
-    quote! { #s.into() }
-  }
-
-  /// Create an `Option` constructor `TokenStream`.
-  fn opt_lit(item: Option<&impl ToTokens>) -> TokenStream {
-    match item {
-      None => quote! { ::core::option::Option::None },
-      Some(item) => quote! { ::core::option::Option::Some(#item) },
-    }
-  }
-
-  /// Helper function to combine an `opt_lit` with `str_lit`.
-  fn opt_str_lit(item: Option<impl AsRef<str>>) -> TokenStream {
-    opt_lit(item.map(str_lit).as_ref())
-  }
-
-  /// Helper function to combine an `opt_lit` with a list of `str_lit`
-  fn opt_vec_str_lit(item: Option<impl IntoIterator<Item = impl AsRef<str>>>) -> TokenStream {
-    opt_lit(item.map(|list| vec_lit(list, str_lit)).as_ref())
-  }
-
-  /// Create a `Vec` constructor, mapping items with a function that spits out `TokenStream`s.
-  fn vec_lit<Raw, Tokens>(
-    list: impl IntoIterator<Item = Raw>,
-    map: impl Fn(Raw) -> Tokens,
-  ) -> TokenStream
-  where
-    Tokens: ToTokens,
-  {
-    let items = list.into_iter().map(map);
-    quote! { vec![#(#items),*] }
-  }
-
-  /// Create a `PathBuf` constructor `TokenStream`.
-  ///
-  /// e.g. `"Hello World" -> String::from("Hello World").
-  fn path_buf_lit(s: impl AsRef<Path>) -> TokenStream {
-    let s = s.as_ref().to_string_lossy().into_owned();
-    quote! { ::std::path::PathBuf::from(#s) }
-  }
-
-  /// Creates a `Url` constructor `TokenStream`.
-  fn url_lit(url: &Url) -> TokenStream {
-    let url = url.as_str();
-    quote! { #url.parse().unwrap() }
-  }
-
-  /// Create a map constructor, mapping keys and values with other `TokenStream`s.
-  ///
-  /// This function is pretty generic because the types of keys AND values get transformed.
-  fn map_lit<Map, Key, Value, TokenStreamKey, TokenStreamValue, FuncKey, FuncValue>(
-    map_type: TokenStream,
-    map: Map,
-    map_key: FuncKey,
-    map_value: FuncValue,
-  ) -> TokenStream
-  where
-    <Map as IntoIterator>::IntoIter: ExactSizeIterator,
-    Map: IntoIterator<Item = (Key, Value)>,
-    TokenStreamKey: ToTokens,
-    TokenStreamValue: ToTokens,
-    FuncKey: Fn(Key) -> TokenStreamKey,
-    FuncValue: Fn(Value) -> TokenStreamValue,
-  {
-    let ident = quote::format_ident!("map");
-    let map = map.into_iter();
-
-    if map.len() > 0 {
-      let items = map.map(|(key, value)| {
-        let key = map_key(key);
-        let value = map_value(value);
-        quote! { #ident.insert(#key, #value); }
-      });
-
-      quote! {{
-        let mut #ident = #map_type::new();
-        #(#items)*
-        #ident
-      }}
-    } else {
-      quote! { #map_type::new() }
-    }
-  }
-
-  /// Create a `serde_json::Value` variant `TokenStream` for a number
-  fn json_value_number_lit(num: &serde_json::Number) -> TokenStream {
-    // See https://docs.rs/serde_json/1/serde_json/struct.Number.html for guarantees
-    let prefix = quote! { ::serde_json::Value };
-    if num.is_u64() {
-      // guaranteed u64
-      let num = num.as_u64().unwrap();
-      quote! { #prefix::Number(#num.into()) }
-    } else if num.is_i64() {
-      // guaranteed i64
-      let num = num.as_i64().unwrap();
-      quote! { #prefix::Number(#num.into()) }
-    } else if num.is_f64() {
-      // guaranteed f64
-      let num = num.as_f64().unwrap();
-      quote! { #prefix::Number(#num.into()) }
-    } else {
-      // invalid number
-      quote! { #prefix::Null }
-    }
-  }
-
-  /// Create a `serde_json::Value` constructor `TokenStream`
-  fn json_value_lit(jv: &JsonValue) -> TokenStream {
-    let prefix = quote! { ::serde_json::Value };
-
-    match jv {
-      JsonValue::Null => quote! { #prefix::Null },
-      JsonValue::Bool(bool) => quote! { #prefix::Bool(#bool) },
-      JsonValue::Number(number) => json_value_number_lit(number),
-      JsonValue::String(str) => {
-        let s = str_lit(str);
-        quote! { #prefix::String(#s) }
-      }
-      JsonValue::Array(vec) => {
-        let items = vec.iter().map(json_value_lit);
-        quote! { #prefix::Array(vec![#(#items),*]) }
-      }
-      JsonValue::Object(map) => {
-        let map = map_lit(quote! { ::serde_json::Map }, map, str_lit, json_value_lit);
-        quote! { #prefix::Object(#map) }
-      }
-    }
-  }
-
-  /// Write a `TokenStream` of the `$struct`'s fields to the `$tokens`.
-  ///
-  /// All fields must represent a binding of the same name that implements `ToTokens`.
-  macro_rules! literal_struct {
-    ($tokens:ident, $struct:ident, $($field:ident),+) => {
-      $tokens.append_all(quote! {
-        ::tauri::utils::config::$struct {
-          $($field: #$field),+
-        }
-      });
-    };
-  }
-
-  impl ToTokens for WindowUrl {
+  impl ToTokens for WebviewUrl {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-      let prefix = quote! { ::tauri::utils::config::WindowUrl };
+      let prefix = quote! { ::tauri::utils::config::WebviewUrl };
 
       tokens.append_all(match self {
         Self::App(path) => {
-          let path = path_buf_lit(&path);
+          let path = path_buf_lit(path);
           quote! { #prefix::App(#path) }
         }
         Self::External(url) => {
           let url = url_lit(url);
           quote! { #prefix::External(#url) }
+        }
+        Self::CustomProtocol(url) => {
+          let url = url_lit(url);
+          quote! { #prefix::CustomProtocol(#url) }
         }
       })
     }
@@ -2705,11 +2256,98 @@ mod build {
     }
   }
 
+  impl ToTokens for Color {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+      let Color(r, g, b, a) = self;
+      tokens.append_all(quote! {::tauri::utils::config::Color(#r,#g,#b,#a)});
+    }
+  }
+  impl ToTokens for WindowEffectsConfig {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+      let effects = vec_lit(self.effects.clone(), |d| d);
+      let state = opt_lit(self.state.as_ref());
+      let radius = opt_lit(self.radius.as_ref());
+      let color = opt_lit(self.color.as_ref());
+
+      literal_struct!(
+        tokens,
+        ::tauri::utils::config::WindowEffectsConfig,
+        effects,
+        state,
+        radius,
+        color
+      )
+    }
+  }
+
+  impl ToTokens for crate::TitleBarStyle {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+      let prefix = quote! { ::tauri::utils::TitleBarStyle };
+
+      tokens.append_all(match self {
+        Self::Visible => quote! { #prefix::Visible },
+        Self::Transparent => quote! { #prefix::Transparent },
+        Self::Overlay => quote! { #prefix::Overlay },
+      })
+    }
+  }
+
+  impl ToTokens for crate::WindowEffect {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+      let prefix = quote! { ::tauri::utils::WindowEffect };
+
+      #[allow(deprecated)]
+      tokens.append_all(match self {
+        WindowEffect::AppearanceBased => quote! { #prefix::AppearanceBased},
+        WindowEffect::Light => quote! { #prefix::Light},
+        WindowEffect::Dark => quote! { #prefix::Dark},
+        WindowEffect::MediumLight => quote! { #prefix::MediumLight},
+        WindowEffect::UltraDark => quote! { #prefix::UltraDark},
+        WindowEffect::Titlebar => quote! { #prefix::Titlebar},
+        WindowEffect::Selection => quote! { #prefix::Selection},
+        WindowEffect::Menu => quote! { #prefix::Menu},
+        WindowEffect::Popover => quote! { #prefix::Popover},
+        WindowEffect::Sidebar => quote! { #prefix::Sidebar},
+        WindowEffect::HeaderView => quote! { #prefix::HeaderView},
+        WindowEffect::Sheet => quote! { #prefix::Sheet},
+        WindowEffect::WindowBackground => quote! { #prefix::WindowBackground},
+        WindowEffect::HudWindow => quote! { #prefix::HudWindow},
+        WindowEffect::FullScreenUI => quote! { #prefix::FullScreenUI},
+        WindowEffect::Tooltip => quote! { #prefix::Tooltip},
+        WindowEffect::ContentBackground => quote! { #prefix::ContentBackground},
+        WindowEffect::UnderWindowBackground => quote! { #prefix::UnderWindowBackground},
+        WindowEffect::UnderPageBackground => quote! { #prefix::UnderPageBackground},
+        WindowEffect::Mica => quote! { #prefix::Mica},
+        WindowEffect::MicaDark => quote! { #prefix::MicaDark},
+        WindowEffect::MicaLight => quote! { #prefix::MicaLight},
+        WindowEffect::Blur => quote! { #prefix::Blur},
+        WindowEffect::Acrylic => quote! { #prefix::Acrylic},
+        WindowEffect::Tabbed => quote! { #prefix::Tabbed },
+        WindowEffect::TabbedDark => quote! { #prefix::TabbedDark },
+        WindowEffect::TabbedLight => quote! { #prefix::TabbedLight },
+      })
+    }
+  }
+
+  impl ToTokens for crate::WindowEffectState {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+      let prefix = quote! { ::tauri::utils::WindowEffectState };
+
+      #[allow(deprecated)]
+      tokens.append_all(match self {
+        WindowEffectState::Active => quote! { #prefix::Active},
+        WindowEffectState::FollowsWindowActiveState => quote! { #prefix::FollowsWindowActiveState},
+        WindowEffectState::Inactive => quote! { #prefix::Inactive},
+      })
+    }
+  }
+
   impl ToTokens for WindowConfig {
     fn to_tokens(&self, tokens: &mut TokenStream) {
       let label = str_lit(&self.label);
       let url = &self.url;
-      let file_drop_enabled = self.file_drop_enabled;
+      let user_agent = opt_str_lit(self.user_agent.as_ref());
+      let drag_drop_enabled = self.drag_drop_enabled;
       let center = self.center;
       let x = opt_lit(self.x.as_ref());
       let y = opt_lit(self.y.as_ref());
@@ -2720,23 +2358,41 @@ mod build {
       let max_width = opt_lit(self.max_width.as_ref());
       let max_height = opt_lit(self.max_height.as_ref());
       let resizable = self.resizable;
+      let maximizable = self.maximizable;
+      let minimizable = self.minimizable;
+      let closable = self.closable;
       let title = str_lit(&self.title);
+      let proxy_url = opt_lit(self.proxy_url.as_ref().map(url_lit).as_ref());
       let fullscreen = self.fullscreen;
       let focus = self.focus;
       let transparent = self.transparent;
       let maximized = self.maximized;
       let visible = self.visible;
       let decorations = self.decorations;
+      let always_on_bottom = self.always_on_bottom;
       let always_on_top = self.always_on_top;
+      let visible_on_all_workspaces = self.visible_on_all_workspaces;
+      let content_protected = self.content_protected;
       let skip_taskbar = self.skip_taskbar;
       let theme = opt_lit(self.theme.as_ref());
+      let title_bar_style = &self.title_bar_style;
+      let hidden_title = self.hidden_title;
+      let accept_first_mouse = self.accept_first_mouse;
+      let tabbing_identifier = opt_str_lit(self.tabbing_identifier.as_ref());
+      let additional_browser_args = opt_str_lit(self.additional_browser_args.as_ref());
+      let shadow = self.shadow;
+      let window_effects = opt_lit(self.window_effects.as_ref());
+      let incognito = self.incognito;
+      let parent = opt_str_lit(self.parent.as_ref());
+      let zoom_hotkeys_enabled = self.zoom_hotkeys_enabled;
 
       literal_struct!(
         tokens,
-        WindowConfig,
+        ::tauri::utils::config::WindowConfig,
         label,
         url,
-        file_drop_enabled,
+        user_agent,
+        drag_drop_enabled,
         center,
         x,
         y,
@@ -2747,113 +2403,33 @@ mod build {
         max_width,
         max_height,
         resizable,
+        maximizable,
+        minimizable,
+        closable,
         title,
+        proxy_url,
         fullscreen,
         focus,
         transparent,
         maximized,
         visible,
         decorations,
+        always_on_bottom,
         always_on_top,
+        visible_on_all_workspaces,
+        content_protected,
         skip_taskbar,
-        theme
-      );
-    }
-  }
-
-  impl ToTokens for CliArg {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-      let short = opt_lit(self.short.as_ref());
-      let name = str_lit(&self.name);
-      let description = opt_str_lit(self.description.as_ref());
-      let long_description = opt_str_lit(self.long_description.as_ref());
-      let takes_value = self.takes_value;
-      let multiple = self.multiple;
-      let multiple_occurrences = self.multiple_occurrences;
-      let number_of_values = opt_lit(self.number_of_values.as_ref());
-      let possible_values = opt_vec_str_lit(self.possible_values.as_ref());
-      let min_values = opt_lit(self.min_values.as_ref());
-      let max_values = opt_lit(self.max_values.as_ref());
-      let required = self.required;
-      let required_unless_present = opt_str_lit(self.required_unless_present.as_ref());
-      let required_unless_present_all = opt_vec_str_lit(self.required_unless_present_all.as_ref());
-      let required_unless_present_any = opt_vec_str_lit(self.required_unless_present_any.as_ref());
-      let conflicts_with = opt_str_lit(self.conflicts_with.as_ref());
-      let conflicts_with_all = opt_vec_str_lit(self.conflicts_with_all.as_ref());
-      let requires = opt_str_lit(self.requires.as_ref());
-      let requires_all = opt_vec_str_lit(self.requires_all.as_ref());
-      let requires_if = opt_vec_str_lit(self.requires_if.as_ref());
-      let required_if_eq = opt_vec_str_lit(self.required_if_eq.as_ref());
-      let require_equals = opt_lit(self.require_equals.as_ref());
-      let index = opt_lit(self.index.as_ref());
-
-      literal_struct!(
-        tokens,
-        CliArg,
-        short,
-        name,
-        description,
-        long_description,
-        takes_value,
-        multiple,
-        multiple_occurrences,
-        number_of_values,
-        possible_values,
-        min_values,
-        max_values,
-        required,
-        required_unless_present,
-        required_unless_present_all,
-        required_unless_present_any,
-        conflicts_with,
-        conflicts_with_all,
-        requires,
-        requires_all,
-        requires_if,
-        required_if_eq,
-        require_equals,
-        index
-      );
-    }
-  }
-
-  impl ToTokens for CliConfig {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-      let description = opt_str_lit(self.description.as_ref());
-      let long_description = opt_str_lit(self.long_description.as_ref());
-      let before_help = opt_str_lit(self.before_help.as_ref());
-      let after_help = opt_str_lit(self.after_help.as_ref());
-      let args = {
-        let args = self.args.as_ref().map(|args| {
-          let arg = args.iter().map(|a| quote! { #a });
-          quote! { vec![#(#arg),*] }
-        });
-        opt_lit(args.as_ref())
-      };
-      let subcommands = opt_lit(
-        self
-          .subcommands
-          .as_ref()
-          .map(|map| {
-            map_lit(
-              quote! { ::std::collections::HashMap },
-              map,
-              str_lit,
-              identity,
-            )
-          })
-          .as_ref(),
-      );
-
-      literal_struct!(
-        tokens,
-        CliConfig,
-        description,
-        long_description,
-        before_help,
-        after_help,
-        args,
-        subcommands
+        theme,
+        title_bar_style,
+        hidden_title,
+        accept_first_mouse,
+        tabbing_identifier,
+        additional_browser_args,
+        shadow,
+        window_effects,
+        incognito,
+        parent,
+        zoom_hotkeys_enabled
       );
     }
   }
@@ -2864,6 +2440,8 @@ mod build {
 
       tokens.append_all(match self {
         Self::Brownfield => quote! { #prefix::Brownfield },
+        #[cfg(not(feature = "isolation"))]
+        Self::Isolation { dir: _ } => quote! { #prefix::Brownfield },
         #[cfg(feature = "isolation")]
         Self::Isolation { dir } => {
           let dir = path_buf_lit(dir);
@@ -2873,17 +2451,41 @@ mod build {
     }
   }
 
+  impl ToTokens for WebviewInstallMode {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+      let prefix = quote! { ::tauri::utils::config::WebviewInstallMode };
+
+      tokens.append_all(match self {
+        Self::Skip => quote! { #prefix::Skip },
+        Self::DownloadBootstrapper { silent } => {
+          quote! { #prefix::DownloadBootstrapper { silent: #silent } }
+        }
+        Self::EmbedBootstrapper { silent } => {
+          quote! { #prefix::EmbedBootstrapper { silent: #silent } }
+        }
+        Self::OfflineInstaller { silent } => {
+          quote! { #prefix::OfflineInstaller { silent: #silent } }
+        }
+        Self::FixedRuntime { path } => {
+          let path = path_buf_lit(path);
+          quote! { #prefix::FixedRuntime { path: #path } }
+        }
+      })
+    }
+  }
+
   impl ToTokens for WindowsConfig {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-      let webview_fixed_runtime_path = opt_lit(
-        self
-          .webview_fixed_runtime_path
-          .as_ref()
-          .map(path_buf_lit)
-          .as_ref(),
-      );
+      let webview_install_mode = if let Some(fixed_runtime_path) = &self.webview_fixed_runtime_path
+      {
+        WebviewInstallMode::FixedRuntime {
+          path: fixed_runtime_path.clone(),
+        }
+      } else {
+        self.webview_install_mode.clone()
+      };
       tokens.append_all(quote! { ::tauri::utils::config::WindowsConfig {
-        webview_fixed_runtime_path: #webview_fixed_runtime_path,
+        webview_install_mode: #webview_install_mode,
         ..Default::default()
       }})
     }
@@ -2891,49 +2493,66 @@ mod build {
 
   impl ToTokens for BundleConfig {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-      let identifier = str_lit(&self.identifier);
+      let publisher = quote!(None);
+      let homepage = quote!(None);
       let icon = vec_lit(&self.icon, str_lit);
       let active = self.active;
       let targets = quote!(Default::default());
+      let create_updater_artifacts = quote!(Default::default());
       let resources = quote!(None);
       let copyright = quote!(None);
       let category = quote!(None);
+      let file_associations = quote!(None);
       let short_description = quote!(None);
       let long_description = quote!(None);
-      let appimage = quote!(Default::default());
-      let deb = quote!(Default::default());
-      let macos = quote!(Default::default());
-      let external_bin = opt_vec_str_lit(self.external_bin.as_ref());
+      let external_bin = opt_vec_lit(self.external_bin.as_ref(), str_lit);
       let windows = &self.windows;
+      let license = opt_str_lit(self.license.as_ref());
+      let license_file = opt_lit(self.license_file.as_ref().map(path_buf_lit).as_ref());
+      let linux = quote!(Default::default());
+      let macos = quote!(Default::default());
+      let ios = quote!(Default::default());
+      let android = quote!(Default::default());
 
       literal_struct!(
         tokens,
-        BundleConfig,
+        ::tauri::utils::config::BundleConfig,
         active,
-        identifier,
+        publisher,
+        homepage,
         icon,
         targets,
+        create_updater_artifacts,
         resources,
         copyright,
         category,
+        license,
+        license_file,
+        file_associations,
         short_description,
         long_description,
-        appimage,
-        deb,
-        macos,
         external_bin,
-        windows
+        windows,
+        linux,
+        macos,
+        ios,
+        android
       );
     }
   }
 
-  impl ToTokens for AppUrl {
+  impl ToTokens for FrontendDist {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-      let prefix = quote! { ::tauri::utils::config::AppUrl };
+      let prefix = quote! { ::tauri::utils::config::FrontendDist };
 
       tokens.append_all(match self {
         Self::Url(url) => {
+          let url = url_lit(url);
           quote! { #prefix::Url(#url) }
+        }
+        Self::Directory(path) => {
+          let path = path_buf_lit(path);
+          quote! { #prefix::Directory(#path) }
         }
         Self::Files(files) => {
           let files = vec_lit(files, path_buf_lit);
@@ -2945,74 +2564,24 @@ mod build {
 
   impl ToTokens for BuildConfig {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-      let dev_path = &self.dev_path;
-      let dist_dir = &self.dist_dir;
-      let with_global_tauri = self.with_global_tauri;
+      let dev_url = opt_lit(self.dev_url.as_ref().map(url_lit).as_ref());
+      let frontend_dist = opt_lit(self.frontend_dist.as_ref());
       let runner = quote!(None);
       let before_dev_command = quote!(None);
       let before_build_command = quote!(None);
+      let before_bundle_command = quote!(None);
       let features = quote!(None);
 
       literal_struct!(
         tokens,
-        BuildConfig,
+        ::tauri::utils::config::BuildConfig,
         runner,
-        dev_path,
-        dist_dir,
-        with_global_tauri,
+        dev_url,
+        frontend_dist,
         before_dev_command,
         before_build_command,
+        before_bundle_command,
         features
-      );
-    }
-  }
-
-  impl ToTokens for WindowsUpdateInstallMode {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-      let prefix = quote! { ::tauri::utils::config::WindowsUpdateInstallMode };
-
-      tokens.append_all(match self {
-        Self::BasicUi => quote! { #prefix::BasicUi },
-        Self::Quiet => quote! { #prefix::Quiet },
-        Self::Passive => quote! { #prefix::Passive },
-      })
-    }
-  }
-
-  impl ToTokens for UpdaterWindowsConfig {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-      let install_mode = &self.install_mode;
-      literal_struct!(tokens, UpdaterWindowsConfig, install_mode);
-    }
-  }
-
-  impl ToTokens for UpdaterConfig {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-      let active = self.active;
-      let dialog = self.dialog;
-      let pubkey = str_lit(&self.pubkey);
-      let endpoints = opt_lit(
-        self
-          .endpoints
-          .as_ref()
-          .map(|list| {
-            vec_lit(list, |url| {
-              let url = url.0.as_str();
-              quote! { ::tauri::utils::config::UpdaterEndpoint(#url.parse().unwrap()) }
-            })
-          })
-          .as_ref(),
-      );
-      let windows = &self.windows;
-
-      literal_struct!(
-        tokens,
-        UpdaterConfig,
-        active,
-        dialog,
-        pubkey,
-        endpoints,
-        windows
       );
     }
   }
@@ -3072,181 +2641,111 @@ mod build {
     }
   }
 
+  impl ToTokens for CapabilityEntry {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+      let prefix = quote! { ::tauri::utils::config::CapabilityEntry };
+
+      tokens.append_all(match self {
+        Self::Inlined(capability) => {
+          quote! { #prefix::Inlined(#capability) }
+        }
+        Self::Reference(id) => {
+          let id = str_lit(id);
+          quote! { #prefix::Reference(#id) }
+        }
+      });
+    }
+  }
+
   impl ToTokens for SecurityConfig {
     fn to_tokens(&self, tokens: &mut TokenStream) {
       let csp = opt_lit(self.csp.as_ref());
       let dev_csp = opt_lit(self.dev_csp.as_ref());
       let freeze_prototype = self.freeze_prototype;
       let dangerous_disable_asset_csp_modification = &self.dangerous_disable_asset_csp_modification;
+      let asset_protocol = &self.asset_protocol;
+      let pattern = &self.pattern;
+      let capabilities = vec_lit(&self.capabilities, identity);
 
       literal_struct!(
         tokens,
-        SecurityConfig,
+        ::tauri::utils::config::SecurityConfig,
         csp,
         dev_csp,
         freeze_prototype,
-        dangerous_disable_asset_csp_modification
+        dangerous_disable_asset_csp_modification,
+        asset_protocol,
+        pattern,
+        capabilities
       );
     }
   }
 
-  impl ToTokens for SystemTrayConfig {
+  impl ToTokens for TrayIconConfig {
     fn to_tokens(&self, tokens: &mut TokenStream) {
+      let id = opt_str_lit(self.id.as_ref());
       let icon_as_template = self.icon_as_template;
+      let menu_on_left_click = self.menu_on_left_click;
       let icon_path = path_buf_lit(&self.icon_path);
-      literal_struct!(tokens, SystemTrayConfig, icon_path, icon_as_template);
+      let title = opt_str_lit(self.title.as_ref());
+      let tooltip = opt_str_lit(self.tooltip.as_ref());
+      literal_struct!(
+        tokens,
+        ::tauri::utils::config::TrayIconConfig,
+        id,
+        icon_path,
+        icon_as_template,
+        menu_on_left_click,
+        title,
+        tooltip
+      );
     }
   }
 
-  impl ToTokens for FsAllowlistScope {
+  impl ToTokens for FsScope {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-      let prefix = quote! { ::tauri::utils::config::FsAllowlistScope };
+      let prefix = quote! { ::tauri::utils::config::FsScope };
 
       tokens.append_all(match self {
         Self::AllowedPaths(allow) => {
           let allowed_paths = vec_lit(allow, path_buf_lit);
           quote! { #prefix::AllowedPaths(#allowed_paths) }
         }
-        Self::Scope { allow, deny } => {
+        Self::Scope { allow, deny , require_literal_leading_dot} => {
           let allow = vec_lit(allow, path_buf_lit);
           let deny = vec_lit(deny, path_buf_lit);
-          quote! { #prefix::Scope { allow: #allow, deny: #deny } }
+          let  require_literal_leading_dot = opt_lit(require_literal_leading_dot.as_ref());
+          quote! { #prefix::Scope { allow: #allow, deny: #deny, require_literal_leading_dot: #require_literal_leading_dot } }
         }
       });
     }
   }
 
-  impl ToTokens for FsAllowlistConfig {
+  impl ToTokens for AssetProtocolConfig {
     fn to_tokens(&self, tokens: &mut TokenStream) {
       let scope = &self.scope;
-      tokens.append_all(quote! { ::tauri::utils::config::FsAllowlistConfig { scope: #scope, ..Default::default() } })
+      tokens.append_all(quote! { ::tauri::utils::config::AssetProtocolConfig { scope: #scope, ..Default::default() } })
     }
   }
 
-  impl ToTokens for ProtocolAllowlistConfig {
+  impl ToTokens for AppConfig {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-      let asset_scope = &self.asset_scope;
-      tokens.append_all(quote! { ::tauri::utils::config::ProtocolAllowlistConfig { asset_scope: #asset_scope, ..Default::default() } })
-    }
-  }
-
-  impl ToTokens for HttpAllowlistScope {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-      let allowed_urls = vec_lit(&self.0, url_lit);
-      tokens.append_all(quote! { ::tauri::utils::config::HttpAllowlistScope(#allowed_urls) })
-    }
-  }
-
-  impl ToTokens for HttpAllowlistConfig {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-      let scope = &self.scope;
-      tokens.append_all(quote! { ::tauri::utils::config::HttpAllowlistConfig { scope: #scope, ..Default::default() } })
-    }
-  }
-
-  impl ToTokens for ShellAllowedCommand {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-      let name = str_lit(&self.name);
-      let command = path_buf_lit(&self.command);
-      let args = &self.args;
-      let sidecar = &self.sidecar;
-
-      literal_struct!(tokens, ShellAllowedCommand, name, command, args, sidecar);
-    }
-  }
-
-  impl ToTokens for ShellAllowedArgs {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-      let prefix = quote! { ::tauri::utils::config::ShellAllowedArgs };
-
-      tokens.append_all(match self {
-        Self::Flag(flag) => quote!(#prefix::Flag(#flag)),
-        Self::List(list) => {
-          let list = vec_lit(list, identity);
-          quote!(#prefix::List(#list))
-        }
-      })
-    }
-  }
-
-  impl ToTokens for ShellAllowedArg {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-      let prefix = quote! { ::tauri::utils::config::ShellAllowedArg };
-
-      tokens.append_all(match self {
-        Self::Fixed(fixed) => {
-          let fixed = str_lit(fixed);
-          quote!(#prefix::Fixed(#fixed))
-        }
-        Self::Var { validator } => {
-          let validator = str_lit(validator);
-          quote!(#prefix::Var { validator: #validator })
-        }
-      })
-    }
-  }
-
-  impl ToTokens for ShellAllowlistOpen {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-      let prefix = quote! { ::tauri::utils::config::ShellAllowlistOpen };
-
-      tokens.append_all(match self {
-        Self::Flag(flag) => quote!(#prefix::Flag(#flag)),
-        Self::Validate(regex) => quote!(#prefix::Validate(#regex)),
-      })
-    }
-  }
-
-  impl ToTokens for ShellAllowlistScope {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-      let allowed_commands = vec_lit(&self.0, identity);
-      tokens.append_all(quote! { ::tauri::utils::config::ShellAllowlistScope(#allowed_commands) })
-    }
-  }
-
-  impl ToTokens for ShellAllowlistConfig {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-      let scope = &self.scope;
-      tokens.append_all(quote! { ::tauri::utils::config::ShellAllowlistConfig { scope: #scope, ..Default::default() } })
-    }
-  }
-
-  impl ToTokens for AllowlistConfig {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-      let fs = &self.fs;
-      let protocol = &self.protocol;
-      let http = &self.http;
-      let shell = &self.shell;
-      tokens.append_all(
-        quote! { ::tauri::utils::config::AllowlistConfig { fs: #fs, protocol: #protocol, http: #http, shell: #shell, ..Default::default() } },
-      )
-    }
-  }
-
-  impl ToTokens for TauriConfig {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-      let pattern = &self.pattern;
       let windows = vec_lit(&self.windows, identity);
-      let cli = opt_lit(self.cli.as_ref());
-      let bundle = &self.bundle;
-      let updater = &self.updater;
       let security = &self.security;
-      let system_tray = opt_lit(self.system_tray.as_ref());
-      let allowlist = &self.allowlist;
+      let tray_icon = opt_lit(self.tray_icon.as_ref());
       let macos_private_api = self.macos_private_api;
+      let with_global_tauri = self.with_global_tauri;
+      let enable_gtk_app_id = self.enable_gtk_app_id;
 
       literal_struct!(
         tokens,
-        TauriConfig,
-        pattern,
+        ::tauri::utils::config::AppConfig,
         windows,
-        cli,
-        bundle,
-        updater,
         security,
-        system_tray,
-        allowlist,
-        macos_private_api
+        tray_icon,
+        macos_private_api,
+        with_global_tauri,
+        enable_gtk_app_id
       );
     }
   }
@@ -3263,24 +2762,29 @@ mod build {
     }
   }
 
-  impl ToTokens for PackageConfig {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-      let product_name = opt_str_lit(self.product_name.as_ref());
-      let version = opt_str_lit(self.version.as_ref());
-
-      literal_struct!(tokens, PackageConfig, product_name, version);
-    }
-  }
-
   impl ToTokens for Config {
     fn to_tokens(&self, tokens: &mut TokenStream) {
       let schema = quote!(None);
-      let package = &self.package;
-      let tauri = &self.tauri;
+      let product_name = opt_str_lit(self.product_name.as_ref());
+      let version = opt_str_lit(self.version.as_ref());
+      let identifier = str_lit(&self.identifier);
+      let app = &self.app;
       let build = &self.build;
+      let bundle = &self.bundle;
       let plugins = &self.plugins;
 
-      literal_struct!(tokens, Config, schema, package, tauri, build, plugins);
+      literal_struct!(
+        tokens,
+        ::tauri::utils::config::Config,
+        schema,
+        product_name,
+        version,
+        identifier,
+        app,
+        build,
+        bundle,
+        plugins
+      );
     }
   }
 }
@@ -3294,82 +2798,72 @@ mod test {
   #[test]
   // test all of the default functions
   fn test_defaults() {
-    // get default tauri config
-    let t_config = TauriConfig::default();
+    // get default app config
+    let a_config = AppConfig::default();
     // get default build config
     let b_config = BuildConfig::default();
-    // get default dev path
-    let d_path = default_dev_path();
     // get default window
     let d_windows: Vec<WindowConfig> = vec![];
     // get default bundle
     let d_bundle = BundleConfig::default();
-    // get default updater
-    let d_updater = UpdaterConfig::default();
 
     // create a tauri config.
-    let tauri = TauriConfig {
-      pattern: Default::default(),
+    let app = AppConfig {
       windows: vec![],
-      bundle: BundleConfig {
-        active: false,
-        targets: Default::default(),
-        identifier: String::from(""),
-        icon: Vec::new(),
-        resources: None,
-        copyright: None,
-        category: None,
-        short_description: None,
-        long_description: None,
-        appimage: Default::default(),
-        deb: Default::default(),
-        macos: Default::default(),
-        external_bin: None,
-        windows: Default::default(),
-      },
-      cli: None,
-      updater: UpdaterConfig {
-        active: false,
-        dialog: true,
-        pubkey: "".into(),
-        endpoints: None,
-        windows: Default::default(),
-      },
       security: SecurityConfig {
         csp: None,
         dev_csp: None,
         freeze_prototype: false,
         dangerous_disable_asset_csp_modification: DisabledCspModificationKind::Flag(false),
+        asset_protocol: AssetProtocolConfig::default(),
+        pattern: Default::default(),
+        capabilities: Vec::new(),
       },
-      allowlist: AllowlistConfig::default(),
-      system_tray: None,
+      tray_icon: None,
       macos_private_api: false,
+      with_global_tauri: false,
+      enable_gtk_app_id: false,
     };
 
     // create a build config
     let build = BuildConfig {
       runner: None,
-      dev_path: AppUrl::Url(WindowUrl::External(
-        Url::parse("http://localhost:8080").unwrap(),
-      )),
-      dist_dir: AppUrl::Url(WindowUrl::App("../dist".into())),
+      dev_url: None,
+      frontend_dist: None,
       before_dev_command: None,
       before_build_command: None,
+      before_bundle_command: None,
       features: None,
-      with_global_tauri: false,
+    };
+
+    // create a bundle config
+    let bundle = BundleConfig {
+      active: false,
+      targets: Default::default(),
+      create_updater_artifacts: Default::default(),
+      publisher: None,
+      homepage: None,
+      icon: Vec::new(),
+      resources: None,
+      copyright: None,
+      category: None,
+      file_associations: None,
+      short_description: None,
+      long_description: None,
+      license: None,
+      license_file: None,
+      linux: Default::default(),
+      macos: Default::default(),
+      external_bin: None,
+      windows: Default::default(),
+      ios: Default::default(),
+      android: Default::default(),
     };
 
     // test the configs
-    assert_eq!(t_config, tauri);
+    assert_eq!(a_config, app);
     assert_eq!(b_config, build);
-    assert_eq!(d_bundle, tauri.bundle);
-    assert_eq!(d_updater, tauri.updater);
-    assert_eq!(
-      d_path,
-      AppUrl::Url(WindowUrl::External(
-        Url::parse("http://localhost:8080").unwrap()
-      ))
-    );
-    assert_eq!(d_windows, tauri.windows);
+    assert_eq!(d_bundle, bundle);
+    assert_eq!(d_windows, app.windows);
   }
 }

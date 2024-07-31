@@ -1,8 +1,8 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2019-2024 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-// taken from https://github.com/ChrisDenton/static_vcruntime/
+// taken from <https://github.com/ChrisDenton/static_vcruntime/>
 // we're not using static_vcruntime directly because we want this for debug builds too
 
 use std::{env, fs, io::Write, path::Path};
@@ -10,7 +10,7 @@ use std::{env, fs, io::Write, path::Path};
 pub fn build() {
   override_msvcrt_lib();
 
-  // Disable conflicting libraries that aren't hard coded by Rust.
+  // Disable conflicting libraries that aren't hard coded by Rust
   println!("cargo:rustc-link-arg=/NODEFAULTLIB:libvcruntimed.lib");
   println!("cargo:rustc-link-arg=/NODEFAULTLIB:vcruntime.lib");
   println!("cargo:rustc-link-arg=/NODEFAULTLIB:vcruntimed.lib");
@@ -48,11 +48,11 @@ fn override_msvcrt_lib() {
   let f = fs::OpenOptions::new()
     .write(true)
     .create_new(true)
-    .open(&path);
+    .open(path);
   if let Ok(mut f) = f {
     f.write_all(machine).unwrap();
     f.write_all(bytes).unwrap();
   }
   // Add the output directory to the native library path.
-  println!("cargo:rustc-link-search=native={}", out_dir);
+  println!("cargo:rustc-link-search=native={out_dir}");
 }

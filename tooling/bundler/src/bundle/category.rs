@@ -1,4 +1,5 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2016-2019 Cargo-Bundle developers <https://github.com/burtonageo/cargo-bundle>
+// Copyright 2019-2024 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
@@ -141,9 +142,11 @@ impl AppCategory {
     }
   }
 
-  /// Map an AppCategory to the closest set of GNOME desktop registered
+  /// Map an AppCategory to the closest set of Freedesktop registered
   /// categories that matches that category.
-  pub fn gnome_desktop_categories(self) -> &'static str {
+  ///
+  /// Cf <https://specifications.freedesktop.org/menu-spec/latest/>
+  pub fn freedesktop_categories(self) -> &'static str {
     match &self {
       AppCategory::Business => "Office;",
       AppCategory::DeveloperTool => "Development;",
@@ -253,8 +256,7 @@ impl<'d> serde::de::Visitor<'d> for AppCategoryVisitor {
     match self.did_you_mean {
       Some(string) => write!(
         formatter,
-        "a valid app category string (did you mean \"{}\"?)",
-        string
+        "a valid app category string (did you mean \"{string}\"?)"
       ),
       None => write!(formatter, "a valid app category string"),
     }
@@ -364,7 +366,7 @@ mod tests {
       AppCategory::from_str("Developer Tool"),
       Ok(AppCategory::DeveloperTool)
     );
-    // Lowercase, spaces, and hypens are fine:
+    // Lowercase, spaces, and hyphens are fine:
     assert_eq!(
       AppCategory::from_str(" puzzle  game "),
       Ok(AppCategory::PuzzleGame)
